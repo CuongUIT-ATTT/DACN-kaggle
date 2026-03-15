@@ -178,3 +178,9 @@ tests
 tmp
 *.pkl
 .pt
+*.rar
+*.zip
+datasets/
+joern/
+.env
+logs.log
