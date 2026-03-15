@@ -1,0 +1,3 @@
+[submodule "Illuminati"]
+	path = Illuminati
+	url = https://github.com/David-Egea/Illuminati.git

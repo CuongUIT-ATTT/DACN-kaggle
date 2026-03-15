@@ -1,0 +1,12 @@
+,Benchmark,Benign_Original_Unique,Benign_Original_Upsampled,Benign_Original_Total,Benign_Counterexample_Unique,Benign_Counterexample_Upsampled,Benign_Counterexample_Total,Vulnerable_Original_Unique,Vulnerable_Original_Upsampled,Vulnerable_Original_Total,Vulnerable_Counterexample_Unique,Vulnerable_Counterexample_Upsampled,Vulnerable_Counterexample_Total
+0,100_0,4,8,12,0,0,0,0,0,0,0,0,0
+1,90_10,6,5,11,0,0,0,0,0,0,1,0,1
+2,80_20,6,4,10,0,0,0,0,0,0,2,0,2
+3,70_30,6,3,9,0,0,0,0,0,0,3,0,3
+4,60_40,6,2,8,0,0,0,0,0,0,4,0,4
+5,50_50,6,0,6,0,0,0,0,0,0,6,0,6
+6,40_60,4,0,4,0,0,0,0,0,0,6,2,8
+7,30_70,3,0,3,0,0,0,0,0,0,5,4,9
+8,20_80,2,0,2,0,0,0,0,0,0,5,5,10
+9,10_90,1,0,1,0,0,0,0,0,0,5,6,11
+10,0_100,0,0,0,0,0,0,0,0,0,4,8,12
