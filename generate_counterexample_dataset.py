@@ -4,7 +4,7 @@ import json
 import argparse
 import subprocess
 import pandas as pd
-from groq import Groq
+from openai import OpenAI
 from typing import Dict, List
 from dotenv import load_dotenv
 from rich.progress import Progress
@@ -22,6 +22,9 @@ PATHS = {
         "w2v" : "tmp/cwe20cfa/w2v/"
     }
 MAX_RETRIES = 3 # Maximum retry attempts
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+OPENROUTER_DEFAULT_MODEL = "meta-llama/llama-3.3-70b-instruct"
+client = None
 
 # Args
 parser = argparse.ArgumentParser()
@@ -215,6 +218,21 @@ def json_process(in_path, json_file, debug_index=None):
         print(f"[ERROR] JSON file not found: {json_path}" + (f" for example {debug_index}" if debug_index else ""))
     return None
 
+
+def extract_code_block(response_content: str) -> str:
+    """
+    Extract C code from a model response.
+    Prioritize fenced blocks (```c ... ```), fallback to raw text.
+    """
+    if not response_content:
+        return ""
+
+    fenced = re.findall(r"```(?:c|cpp|C)?\s*(.*?)```", response_content, flags=re.DOTALL)
+    if fenced:
+        return fenced[0].strip()
+
+    return response_content.strip()
+
 # ADVERSARIAL FUNCTIONS
 def generate_counterexample_example(example: pd.Series) -> pd.Series:
     """
@@ -237,8 +255,8 @@ def generate_counterexample_example(example: pd.Series) -> pd.Series:
     """
     
     try:
-        response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+        response = client.chat.completions.create(
+            model=os.getenv("OPENROUTER_MODEL", OPENROUTER_DEFAULT_MODEL),
             messages=[{"role": "user", "content": prompt_template}],
             stream=False,
             temperature=0.7
@@ -246,11 +264,11 @@ def generate_counterexample_example(example: pd.Series) -> pd.Series:
         # Get response content
         response_content = response.choices[0].message.content
         # Extract function code
-        if "```" in response_content:
-            ce_func = response_content.split("```")[1].strip()
-            
-            if ce_func.startswith("c\n"):
-                ce_func = ce_func[2:]
+        ce_func = extract_code_block(response_content)
+
+        if not ce_func:
+            raise ValueError("LLM response did not contain generated function content")
+
         # Create pandas series
         ce = pd.Series(data=[ce_func, 0 if example.target else 1, cwe, example.func], index=["func", "target", "cwe", "orig_func"])
 
@@ -536,8 +554,13 @@ if __name__ == "__main__":
 
     # API Key Loading
     load_dotenv()
-    groq_client = Groq(
-        api_key=os.getenv("GROQ_API_KEY")
+    openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
+    if not openrouter_api_key:
+        raise RuntimeError("Missing OPENROUTER_API_KEY in environment (.env)")
+
+    client = OpenAI(
+        base_url=os.getenv("OPENROUTER_BASE_URL", OPENROUTER_BASE_URL),
+        api_key=openrouter_api_key
     )
 
     # Files path checking
