@@ -30,6 +30,8 @@ PATHS = {
         "w2v" : "tmp/cwe20cfa/w2v/"
     }
 MAX_RETRIES = 3 # Maximum retry attempts
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+OPENROUTER_DEFAULT_MODEL = "openai/gpt-4o-mini"
 
 # Args
 parser = argparse.ArgumentParser()
@@ -246,7 +248,7 @@ def generate_counterexample_example(example: pd.Series) -> pd.Series:
     
     try:
         response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=os.getenv("OPENROUTER_MODEL", OPENROUTER_DEFAULT_MODEL),
             messages=[{"role": "user", "content": prompt_template}],
             stream=False,
             temperature=0.7
@@ -254,11 +256,16 @@ def generate_counterexample_example(example: pd.Series) -> pd.Series:
         # Get response content
         response_content = response.choices[0].message.content
         # Extract function code
+        ce_func = response_content.strip() if response_content else ""
         if "```" in response_content:
             ce_func = response_content.split("```")[1].strip()
             
             if ce_func.startswith("c\n"):
                 ce_func = ce_func[2:]
+
+        if not ce_func:
+            raise ValueError("Empty model response")
+
         # Create pandas series
         ce = pd.Series(data=[ce_func, 0 if example.target else 1, cwe, example.func], index=["func", "target", "cwe", "orig_func"])
 
@@ -544,8 +551,13 @@ if __name__ == "__main__":
 
     # API Key Loading
     load_dotenv()
+    openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
+    if not openrouter_api_key:
+        raise RuntimeError("Missing OPENROUTER_API_KEY in environment")
+
     openai_client = OpenAI(
-        api_key=os.getenv("OPENAI_API_KEY")
+        base_url=os.getenv("OPENROUTER_BASE_URL", OPENROUTER_BASE_URL),
+        api_key=openrouter_api_key
     )
 
     # Files path checking
