@@ -8,6 +8,13 @@ if os.getcwd() not in sys.path:
 import torch
 import subprocess
 import numpy as np
+# Compatibility shim WITHOUT importing numpy.core directly if possible or using dummy for segmentation fixed
+class DummyCoreNumeric:
+    pass
+sys.modules["numpy._core.numeric"] = DummyCoreNumeric
+sys.modules["numpy._core"] = DummyCoreNumeric
+sys.modules["numpy._core.multiarray"] = DummyCoreNumeric
+
 import pandas as pd
 from tqdm import tqdm
 import torch.nn as nn
@@ -599,7 +606,7 @@ if __name__ == "__main__":
     print("-----------------------------------------")
     print("Loading...")
     # TRAIN
-    dataset_df = pd.read_pickle('datasets/cwe20cfa/cwe20cfa_CWE-20_augmented_input_balanced.pkl')
+    dataset_df = pd.read_pickle('datasets/cwe20cfa/cwe20cfa_CWE-20_augmented_input_strictly_balanced.pkl')
     print(f"Dataset loaded. {len(dataset_df)} examples")
     print(dataset_df['target'].value_counts())
 
