@@ -31,379 +31,276 @@ from devign.src.utils.functions.parse import clean_gadget, regex_split_operators
 AVAILABLE_DATASETS = ["train", "valid", "test"]
 NODES_DIM = 205
 WORD2VEC_ARGS = {
-        "vector_size" : 100, 
-        "alpha" : 0.01, 
-        "window" : 5, 
-        "min_count" : 3, 
-        "sample" : 1e-5,
-        "workers" : 4, 
-        "sg" : 1, 
-        "hs" : 0, 
-        "negative" : 5
-    }
+    "vector_size": 100,
+    "alpha": 0.01,
+    "window": 5,
+    "min_count": 3,
+    "sample": 1e-5,
+    "workers": 4,
+    "sg": 1,
+    "hs": 0,
+    "negative": 5,
+}
 EDGE_TYPE = "Ast"
 
-W2V_KV = None
+# Worker-shared keyed vectors (initialized once per process).
+W2V_KV: Optional[Word2VecKeyedVectors] = None
+
+# Precompiled regex patterns for tokenizer performance.
+STRING_LITERAL_RE = re.compile(r'[\"]([^"\\\n]|\\.|\\\n)*[\"]')
+CHAR_LITERAL_RE = re.compile(r"'.*?'")
+MALFORMED_HEX_ESCAPE_RE = re.compile(r'(\\x)([0-9A-Fa-f]{0,1})(?![0-9A-Fa-f])')
+COMMENT_RE = re.compile(r'(/\*([^*]|(\*+[^*\/]))*\*+\/)|(//.*)')
+ESCAPE_CLEAN_RE = re.compile(r'(\n)|(\\\\n)|(\\\\)|(\t)|(\r)')
+SPLITTER_RE = re.compile(r' +|' + regex_split_operators + r'|(\/)|(\;)|(\-)|(\*)')
+
 
 # Args
 parser = argparse.ArgumentParser()
 parser.add_argument(
-    "-d", "--dataset",
+    "-d",
+    "--dataset",
     nargs="*",
     help="Select dataset(s). If not provided, all datasets are used.",
     choices=AVAILABLE_DATASETS,
-    default=['train']
+    default=["train"],
 )
 parser.add_argument(
     "--workers",
     type=int,
     default=max(1, (os.cpu_count() or 2) - 1),
-    help="Number of worker processes for parallel CPU-bound stages.",
+    help="Number of worker processes for parallel CPU-bound processing.",
 )
 parser.add_argument(
     "--chunk-size",
     type=int,
-    default=128,
-    help="Rows per chunk to limit peak memory usage.",
+    default=32,
+    help="chunksize passed to ProcessPoolExecutor.map for lower IPC overhead.",
 )
 args = parser.parse_args()
 
 
+class NodesEmbedding:
+    def __init__(self, nodes_dim: int, w2v_keyed_vectors: Word2VecKeyedVectors):
+        self.w2v_keyed_vectors = w2v_keyed_vectors
+        self.kv_size = w2v_keyed_vectors.vector_size
+        self.nodes_dim = nodes_dim
+        self.target = torch.zeros(self.nodes_dim, self.kv_size + 1).float()
+
+    def __call__(self, nodes):
+        embedded_nodes, code_embedding_mapping = self.embed_nodes(nodes)
+
+        if embedded_nodes.size > 0:
+            nodes_tensor = torch.from_numpy(embedded_nodes).float()
+            self.target[:nodes_tensor.size(0), :] = nodes_tensor
+
+        return self.target, code_embedding_mapping
+
+    def embed_nodes(self, nodes):
+        embeddings = []
+        code_embedding_mapping = {}
+
+        for n_id, node in nodes.items():
+            node_code = node.get_code()
+            if "'\\''" in node_code:
+                node_code = node_code.replace("'\''", "'\\").replace("''", "'")
+
+            tokenized_code, _ = tokenizer_with_mapping(node_code, True)
+            if not tokenized_code:
+                continue
+
+            vectors = self.get_vectors(tokenized_code)
+            source_embedding = np.mean(np.array(vectors), axis=0)
+            embedding = np.concatenate((np.array([node.type]), source_embedding), axis=0)
+            embeddings.append(embedding)
+            code_embedding_mapping[n_id] = (node_code, source_embedding)
+
+        if not embeddings:
+            return np.array([]), code_embedding_mapping
+
+        return np.array(embeddings), code_embedding_mapping
+
+    def get_vectors(self, tokenized_code):
+        vectors = []
+        for token in tokenized_code:
+            if token in self.w2v_keyed_vectors.key_to_index:
+                vectors.append(self.w2v_keyed_vectors[token])
+            else:
+                vectors.append(np.zeros(self.kv_size))
+        return vectors
+
+
+class GraphsEmbedding:
+    def __init__(self, edge_type):
+        self.edge_type = edge_type
+
+    def __call__(self, nodes):
+        connections = self.nodes_connectivity(nodes)
+        return torch.tensor(connections).long()
+
+    def nodes_connectivity(self, nodes):
+        coo = [[], []]
+
+        for node_idx, (node_id, node) in enumerate(nodes.items()):
+            if node_idx != node.order:
+                raise Exception("Something wrong with the order")
+
+            for edge in node.edges.values():
+                if edge.type != self.edge_type:
+                    continue
+
+                if edge.node_in in nodes and edge.node_in != node_id:
+                    coo[0].append(nodes[edge.node_in].order)
+                    coo[1].append(node_idx)
+
+                if edge.node_out in nodes and edge.node_out != node_id:
+                    coo[0].append(node_idx)
+                    coo[1].append(nodes[edge.node_out].order)
+
+        return coo
+
+
+def ensure_directories_exist(paths):
+    for _, path in paths.items():
+        if not os.path.exists(path):
+            os.makedirs(path, exist_ok=True)
+
+
 def tokenizer_with_mapping(code, flag=False) -> Dict[int, List[str]]:
-    # Dictionary to hold the line-to-token mapping
     line_to_tokens_map = {}
     gadget: List[str] = []
     tokenized: List[str] = []
-    # remove all string literals
-    no_str_lit_line = re.sub(r'["]([^"\\\n]|\\.|\\\n)*["]', '', code)
-    # remove all character literals
-    no_char_lit_line = re.sub(r"'.*?'", "", no_str_lit_line)
+
+    no_str_lit_line = STRING_LITERAL_RE.sub("", code)
+    no_char_lit_line = CHAR_LITERAL_RE.sub("", no_str_lit_line)
     code = no_char_lit_line
 
     if flag:
         try:
             code = codecs.getdecoder("unicode_escape")(no_char_lit_line)[0]
         except UnicodeDecodeError:
-            pattern = re.compile(r'(\\x)([0-9A-Fa-f]{0,1})(?![0-9A-Fa-f])')
-            no_char_lit_line = pattern.sub(lambda m: m.group(1) + m.group(2).ljust(2, '0'), no_char_lit_line)
+            no_char_lit_line = MALFORMED_HEX_ESCAPE_RE.sub(
+                lambda m: m.group(1) + m.group(2).ljust(2, "0"),
+                no_char_lit_line,
+            )
             try:
                 code = codecs.getdecoder("unicode_escape")(no_char_lit_line)[0]
             except UnicodeDecodeError:
-                # Keep raw content if malformed escape sequences still exist.
                 code = no_char_lit_line
 
     for line_num, line in enumerate(code.splitlines()):
-        if line == '':
+        if not line:
             continue
+
         stripped = line.strip()
         gadget.append(stripped)
-
-        # Process this line using the clean_gadget function
         clean = clean_gadget(gadget)
 
-        # Process each cleaned line, tokenize and map them to their respective line
         for cg in clean:
-            if cg == '':
+            if not cg:
                 continue
-            # Remove code comments
-            pat = re.compile(r'(/\*([^*]|(\*+[^*\/]))*\*+\/)|(\/\/.*)')
-            cg = re.sub(pat, '', cg)
 
-            # Remove newlines & tabs
-            cg = re.sub('(\n)|(\\\\n)|(\\\\)|(\\t)|(\\r)', '', cg)
-            
-            # Tokenize this cleaned line
-            splitter = r' +|' + regex_split_operators + r'|(\/)|(\;)|(\-)|(\*)'
-            cg_tokens = re.split(splitter, cg)
-
-            # Remove None type and extra spaces
+            cg = COMMENT_RE.sub("", cg)
+            cg = ESCAPE_CLEAN_RE.sub("", cg)
+            cg_tokens = SPLITTER_RE.split(cg)
             cg_tokens = list(filter(None, cg_tokens))
             cg_tokens = list(filter(str.strip, cg_tokens))
-            # List of tokens
-            tokenized.extend(cg_tokens)
 
-            # Map the tokens back to the original line number
+            tokenized.extend(cg_tokens)
             line_to_tokens_map[line_num] = cg_tokens
 
     return tokenized, line_to_tokens_map
+
 
 def tokenize_code(code: Any) -> List[str]:
     tokenized, _ = tokenizer_with_mapping(str(code), True)
     return tokenized
 
-def order_nodes(nodes, max_nodes):
-    # sorts nodes by line and column
 
-    nodes_by_column = sorted(nodes, key=lambda n: int(nodes[n].get_column_number()))
-    nodes_by_line = sorted(nodes_by_column, key=lambda n: int(nodes[n].get_line_number()))
-
-    if len(nodes) > max_nodes:
-        # print(f"CPG cut - original nodes: {len(nodes)} to max: {max_nodes}")
-        nodes_by_line = nodes_by_line[:max_nodes]
-
-    for i, n in enumerate(nodes_by_line):
-        nodes[n].order = i
-    
-    # Create a nodes by line map
-    nodes_by_line_map = {}
-    for n in nodes_by_line:
-        line = nodes[n].get_line_number()
-        code = nodes[n].get_code()
-        try:
-            nodes_by_line_map[line].append(code)
-        except KeyError:
-            nodes_by_line_map[line] = [code]
-
-    nodes_by_line_dict = {key: nodes[key] for key in nodes_by_line}
-    
-    return OrderedDict(nodes_by_line_dict), nodes_by_line_map
-
-def filter_nodes(nodes):
-    return {n_id: node for n_id, node in nodes.items() if node.has_code() and
-            node.has_line_number() and
-            node.label not in ["Comment", "Unknown"]}
-
-def parse_to_nodes(cpg, max_nodes=500):
-    nodes = {}
-    if not cpg or "functions" not in cpg or not cpg["functions"]:
-        return None, None
-    for function in cpg["functions"]:
-        if function is None:
-            continue
-        func = Function(function)
-        # Only nodes with code and line number are selected
-        filtered_nodes = filter_nodes(func.get_nodes())
-        nodes.update(filtered_nodes)
-        # Order nodes and get code line map
-        ordered_nodes, nodes_by_line_map = order_nodes(nodes, max_nodes)
-
-    return ordered_nodes, nodes_by_line_map
-
-def _serialize_nodes_and_edges(ordered_nodes: OrderedDict):
-    node_records = []
-    node_ids = set(ordered_nodes.keys())
-    edge_index = [[], []]
-
-    for node_id, node in ordered_nodes.items():
-        node_records.append(
-            {
-                "node_id": node_id,
-                "order": node.order,
-                "type": node.type,
-                "code": node.get_code(),
-                "label": node.label,
-            }
-        )
-
-    for node_id, node in ordered_nodes.items():
-        src_order = node.order
-        for edge in node.edges.values():
-            if edge.type != EDGE_TYPE:
-                continue
-
-            if edge.node_in in node_ids and edge.node_in != node_id:
-                edge_index[0].append(ordered_nodes[edge.node_in].order)
-                edge_index[1].append(src_order)
-
-            if edge.node_out in node_ids and edge.node_out != node_id:
-                edge_index[0].append(src_order)
-                edge_index[1].append(ordered_nodes[edge.node_out].order)
-
-    return node_records, edge_index
+def load_cwe20cfa_dataset(path: str):
+    data = []
+    with open(path, "r") as file:
+        for line in file:
+            data.append(json.loads(line))
+    df = pd.DataFrame(data)
+    df = df[["func", "target", "cwe"]].dropna()
+    return df
 
 
-def process_cpg_to_nodes_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    try:
-        ordered_nodes, _ = parse_to_nodes(row["cpg"], NODES_DIM)
-        if not ordered_nodes:
-            return None
+def get_cwe_dict(dfs: List[pd.DataFrame]) -> Dict[str, int]:
+    cwe_dict = {}
+    for df in dfs:
+        for cwe_id, number in df.cwe.value_counts().items():
+            try:
+                cwe = cwe_id[0]
+                cwe_dict[cwe] = cwe_dict.get(cwe, 0) + number
+            except IndexError:
+                pass
+    return cwe_dict
 
-        node_records, edge_index = _serialize_nodes_and_edges(ordered_nodes)
-        return {
-            "id": row["id"],
-            "adv": row["adv"],
-            "func": row["func"],
-            "cpg": row["cpg"],
-            "target": int(row["target"]),
-            "cwe": row.get("cwe"),
-            "node_records": node_records,
-            "edge_index": edge_index,
-        }
-    except Exception as e:
-        print(f"[WARN] Failed to parse CPG for id={row.get('id')}: {e}")
-        return None
-
-
-def _init_w2v_worker(keyed_vectors: Word2VecKeyedVectors):
-    global W2V_KV
-    W2V_KV = keyed_vectors
-
-
-def _build_node_feature_tensor(node_records: List[Dict[str, Any]], nodes_dim: int):
-    kv_size = W2V_KV.vector_size
-    target = torch.zeros(nodes_dim, kv_size + 1).float()
-    embeddings = []
-    code_embedding_mapping = {}
-
-    for rec in node_records:
-        node_code = rec["code"]
-        if "'\\''" in node_code:
-            node_code = node_code.replace("'\''", "'\\").replace("''", "'")
-
-        tokenized_code = tokenize_code(node_code)
-        if not tokenized_code:
-            continue
-
-        vectors = []
-        for token in tokenized_code:
-            if token in W2V_KV.key_to_index:
-                vectors.append(W2V_KV[token])
-            else:
-                vectors.append(np.zeros(kv_size))
-
-        source_embedding = np.mean(np.array(vectors), axis=0)
-        embedding = np.concatenate((np.array([rec["type"]]), source_embedding), axis=0)
-        embeddings.append(embedding)
-        code_embedding_mapping[rec["node_id"]] = (node_code, source_embedding)
-
-    if embeddings:
-        nodes_tensor = torch.from_numpy(np.array(embeddings)).float()
-        target[:nodes_tensor.size(0), :] = nodes_tensor
-
-    return target, code_embedding_mapping
-
-
-def process_nodes_to_input_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    try:
-        if W2V_KV is None:
-            raise RuntimeError("W2V worker is not initialized.")
-
-        x, code_embedding_mapping = _build_node_feature_tensor(row["node_records"], NODES_DIM)
-        edge_index = torch.tensor(row["edge_index"]).long()
-        label = torch.tensor([row["target"]]).float()
-        graph_input = Data(x=x, edge_index=edge_index, y=label)
-
-        return {
-            "id": row["id"],
-            "adv": bool(row["adv"]),
-            "func": row["func"],
-            "cpg": row["cpg"],
-            "target": int(row["target"]),
-            "cwe": row.get("cwe"),
-            "input": graph_input,
-            "code_embedding_mapping": code_embedding_mapping,
-        }
-    except Exception as e:
-        print(f"[WARN] Failed to build graph input for id={row.get('id')}: {e}")
-        return None
 
 def extract_cpg_dict(cpg_data):
-    """
-    Extract CPG dictionary from either Dict or List[Dict] format.
-    
-    Args:
-        cpg_data: Either a dict or a list containing a dict
-        
-    Returns:
-        dict: The CPG dictionary
-    """
     if isinstance(cpg_data, list):
-        if len(cpg_data) > 0:
-            return cpg_data[0]
-        else:
-            return None
+        return cpg_data[0] if cpg_data else None
     return cpg_data
 
+
 def flip_target(target):
-    """
-    Flip the target label: 0 -> 1, 1 -> 0
-    
-    Args:
-        target: Original target value
-        
-    Returns:
-        int: Flipped target value
-    """
     return 1 if target == 0 else 0
 
+
 def flatten_dataset(df):
-    """
-    Transform paired dataset (wide format) into stacked format (long format).
-    Each original row becomes two rows:
-    - Original row: adv=False, target flipped, using orig_func/orig_cpg
-    - Adversarial row: adv=True, target unchanged, using func/cpg
-    
-    Args:
-        df: Input DataFrame with orig_func, orig_cpg, func, cpg columns
-        
-    Returns:
-        pd.DataFrame: Flattened dataset ready for processing
-    """
     print("\n[FLATTENING] Transforming dataset from wide to long format...")
     original_count = len(df)
-    
+
     original_rows = []
     adversarial_rows = []
-    
+
     for row in df.itertuples(index=True):
         idx = row.Index
-        # Extract CPG dicts from lists if needed
-        orig_cpg_data = extract_cpg_dict(getattr(row, 'orig_cpg', None))
-        cpg_data = extract_cpg_dict(getattr(row, 'cpg', None))
-        
-        # Skip if CPG data is invalid
+        orig_cpg_data = extract_cpg_dict(getattr(row, "orig_cpg", None))
+        cpg_data = extract_cpg_dict(getattr(row, "cpg", None))
+
         if orig_cpg_data is None or cpg_data is None:
-            print(f"  ⚠ Skipping row {idx}: Invalid CPG data")
             continue
-        
-        # Ensure target is int
-        target_val = int(getattr(row, 'target'))
-        
-        # Create original row (adv=False)
+
+        target_val = int(getattr(row, "target"))
+
         original_row = {
-            'id': str(idx),
-            'adv': False,
-            'func': getattr(row, 'orig_func', None),
-            'cpg': orig_cpg_data,  # Clean dict
-            'target': flip_target(target_val)  # Flipped
+            "id": str(idx),
+            "adv": False,
+            "func": getattr(row, "orig_func", None),
+            "cpg": orig_cpg_data,
+            "target": flip_target(target_val),
         }
-        
-        # Include optional columns if they exist
-        if hasattr(row, 'cwe'):
-            original_row['cwe'] = getattr(row, 'cwe')
-        
-        original_rows.append(original_row)
-        
-        # Create adversarial row (adv=True)
+        if hasattr(row, "cwe"):
+            original_row["cwe"] = getattr(row, "cwe")
+
         adversarial_row = {
-            'id': str(idx),
-            'adv': True,
-            'func': getattr(row, 'func', None),
-            'cpg': cpg_data,  # Clean dict
-            'target': target_val  # Unchanged
+            "id": str(idx),
+            "adv": True,
+            "func": getattr(row, "func", None),
+            "cpg": cpg_data,
+            "target": target_val,
         }
-        
-        # Include optional columns if they exist
-        if hasattr(row, 'cwe'):
-            adversarial_row['cwe'] = getattr(row, 'cwe')
-        
+        if hasattr(row, "cwe"):
+            adversarial_row["cwe"] = getattr(row, "cwe")
+
+        original_rows.append(original_row)
         adversarial_rows.append(adversarial_row)
-    
-    # Combine into single DataFrame
-    flattened_df = pd.concat([
-        pd.DataFrame(original_rows),
-        pd.DataFrame(adversarial_rows)
-    ], ignore_index=True)
-    
-    # Ensure correct data types
-    flattened_df['target'] = flattened_df['target'].astype(int)
-    flattened_df['id'] = flattened_df['id'].astype(str)
-    flattened_df['adv'] = flattened_df['adv'].astype(bool)
-    
+
+    flattened_df = pd.DataFrame(original_rows + adversarial_rows)
+    if flattened_df.empty:
+        return flattened_df
+
+    flattened_df["target"] = flattened_df["target"].astype(int)
+    flattened_df["id"] = flattened_df["id"].astype(str)
+    flattened_df["adv"] = flattened_df["adv"].astype(bool)
+
     print(f"  ✓ Original rows: {original_count}")
-    print(f"  ✓ Flattened rows: {len(flattened_df)} ({len(original_rows)} original + {len(adversarial_rows)} adversarial)")
+    print(f"  ✓ Flattened rows: {len(flattened_df)}")
     print(f"  ✓ Target distribution: {flattened_df['target'].value_counts().to_dict()}")
-    
+
     return flattened_df
 
 
@@ -430,49 +327,126 @@ def train_word2vec_once(corpus_tokens: List[List[str]]) -> Word2Vec:
     return w2vmodel
 
 
-def iter_chunks(records: List[Dict[str, Any]], chunk_size: int):
-    for i in range(0, len(records), chunk_size):
-        yield i, records[i: i + chunk_size]
+def order_nodes(nodes, max_nodes):
+    nodes_by_column = sorted(nodes, key=lambda n: int(nodes[n].get_column_number()))
+    nodes_by_line = sorted(nodes_by_column, key=lambda n: int(nodes[n].get_line_number()))
+
+    if len(nodes) > max_nodes:
+        nodes_by_line = nodes_by_line[:max_nodes]
+
+    for i, n in enumerate(nodes_by_line):
+        nodes[n].order = i
+
+    nodes_by_line_map = {}
+    for n in nodes_by_line:
+        line = nodes[n].get_line_number()
+        code = nodes[n].get_code()
+        if line in nodes_by_line_map:
+            nodes_by_line_map[line].append(code)
+        else:
+            nodes_by_line_map[line] = [code]
+
+    nodes_by_line_dict = {key: nodes[key] for key in nodes_by_line}
+    return OrderedDict(nodes_by_line_dict), nodes_by_line_map
+
+
+def filter_nodes(nodes):
+    return {
+        n_id: node
+        for n_id, node in nodes.items()
+        if node.has_code() and node.has_line_number() and node.label not in ["Comment", "Unknown"]
+    }
+
+
+def parse_to_nodes(cpg, max_nodes=500):
+    nodes = {}
+    if not cpg or "functions" not in cpg or not cpg["functions"]:
+        return None, None
+
+    ordered_nodes = None
+    nodes_by_line_map = None
+
+    for function in cpg["functions"]:
+        if function is None:
+            continue
+        func = Function(function)
+        filtered_nodes = filter_nodes(func.get_nodes())
+        nodes.update(filtered_nodes)
+        ordered_nodes, nodes_by_line_map = order_nodes(nodes, max_nodes)
+
+    return ordered_nodes, nodes_by_line_map
+
+
+def _init_worker(keyed_vectors: Word2VecKeyedVectors):
+    global W2V_KV
+    W2V_KV = keyed_vectors
+
+
+def process_full_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Single worker pipeline to minimize IPC overhead:
+    row -> parse CPG -> node embeddings -> edge index -> Data object.
+    """
+    try:
+        if W2V_KV is None:
+            raise RuntimeError("W2V worker is not initialized.")
+
+        ordered_nodes, _ = parse_to_nodes(row.get("cpg"), NODES_DIM)
+        if not ordered_nodes:
+            return None
+
+        nodes_embedding = NodesEmbedding(NODES_DIM, W2V_KV)
+        graphs_embedding = GraphsEmbedding(EDGE_TYPE)
+
+        x, code_embedding_mapping = nodes_embedding(ordered_nodes)
+        edge_index = graphs_embedding(ordered_nodes)
+        label = torch.tensor([int(row["target"])]).float()
+        graph_input = Data(x=x, edge_index=edge_index, y=label)
+
+        return {
+            "id": str(row["id"]),
+            "adv": bool(row["adv"]),
+            "func": row["func"],
+            "cpg": row["cpg"],
+            "target": int(row["target"]),
+            "cwe": row.get("cwe"),
+            "input": graph_input,
+            "code_embedding_mapping": code_embedding_mapping,
+        }
+    except Exception as e:
+        print(f"[WARN] Failed row id={row.get('id')}: {e}")
+        return None
 
 
 def process_dataset_parallel(dataset_df: pd.DataFrame, w2vmodel: Word2Vec, workers: int, chunk_size: int) -> pd.DataFrame:
     records = dataset_df.to_dict("records")
-    output_rows = []
-
-    with ProcessPoolExecutor(max_workers=workers) as cpg_executor, ProcessPoolExecutor(
-        max_workers=workers,
-        initializer=_init_w2v_worker,
-        initargs=(w2vmodel.wv,),
-    ) as input_executor, Progress(
-        TextColumn("[bold magenta]Processing chunks ({task.completed}/{task.total})..."),
-        BarColumn(),
-        TextColumn("[bold cyan]{task.percentage:>3.1f}%"),
-        TimeRemainingColumn(),
-    ) as progress:
-        total_chunks = max(1, (len(records) + chunk_size - 1) // chunk_size)
-        main_task = progress.add_task("[magenta]Chunk processing", total=total_chunks)
-
-        for start, chunk in iter_chunks(records, chunk_size):
-            cpg_rows = list(cpg_executor.map(process_cpg_to_nodes_row, chunk))
-            cpg_rows = [row for row in cpg_rows if row is not None]
-
-            if cpg_rows:
-                input_rows = list(input_executor.map(process_nodes_to_input_row, cpg_rows))
-
-                output_rows.extend([row for row in input_rows if row is not None])
-
-            del cpg_rows
-            if "input_rows" in locals():
-                del input_rows
-            gc.collect()
-
-            progress.update(main_task, advance=1)
-            print(f"\n  ✓ Processed rows {start} to {min(start + chunk_size, len(records))}")
-
-    if not output_rows:
+    if not records:
         return pd.DataFrame(columns=["id", "adv", "func", "cpg", "target", "input"])
 
-    output_df = pd.DataFrame(output_rows)
+    with ProcessPoolExecutor(
+        max_workers=workers,
+        initializer=_init_worker,
+        initargs=(w2vmodel.wv,),
+    ) as executor:
+        with Progress(
+            TextColumn("[bold magenta]Processing rows..."),
+            BarColumn(),
+            TextColumn("[bold cyan]{task.percentage:>3.1f}%"),
+            TimeRemainingColumn(),
+        ) as progress:
+            task = progress.add_task("[magenta]Worker map", total=len(records))
+
+            results = []
+            for item in executor.map(process_full_row, records, chunksize=chunk_size):
+                results.append(item)
+                progress.update(task, advance=1)
+
+    results_list = [item for item in results if item is not None]
+
+    if not results_list:
+        return pd.DataFrame(columns=["id", "adv", "func", "cpg", "target", "input"])
+
+    output_df = pd.DataFrame(results_list)
     columns = ["id", "adv", "func", "cpg", "target", "input", "cwe", "code_embedding_mapping"]
     output_df = output_df[[col for col in columns if col in output_df.columns]]
     return output_df
@@ -513,28 +487,25 @@ def enforce_strictly_balanced_pairs(df: pd.DataFrame) -> pd.DataFrame:
 
     return strict_df
 
+
 if __name__ == "__main__":
-
     for dataset in args.dataset:
-
         print(f"\nGenerating INPUT for {dataset.upper()} dataset")
         print("=" * 80)
 
         dataset_path = f"datasets/cwe20cfa/cwe20cfa_CWE-20_augmented_{dataset}.pkl"
-        output_path = f"datasets/cwe20cfa/cwe20cfa_CWE-20_augmented_input_balanced.pkl"
+        output_path = "datasets/cwe20cfa/cwe20cfa_CWE-20_augmented_input_balanced.pkl"
 
         if os.path.exists(output_path):
             print(f"⚠ Output file already exists and will be overwritten: {output_path}")
-            dataset_df = pd.read_pickle(dataset_path)
-        else:
-            dataset_df = pd.read_pickle(dataset_path)
+
+        dataset_df = pd.read_pickle(dataset_path)
 
         print(f"\n✓ Loaded {len(dataset_df)} rows from: {dataset_path}")
         print(f"  Columns: {list(dataset_df.columns)}")
-        
-        # FLATTEN THE DATASET BEFORE PROCESSING
+
         dataset_df = flatten_dataset(dataset_df)
-        
+
         total_examples = len(dataset_df)
         print(f"\n✓ Total examples to process after flattening: {total_examples}")
 
@@ -552,11 +523,13 @@ if __name__ == "__main__":
 
         os.makedirs("tmp/cwe20cfa/w2v", exist_ok=True)
         w2v_path = "tmp/cwe20cfa/w2v/w2vmodel.wv"
-        w2vmodel.save(w2v_path)
+        w2vmodel.wv.save(w2v_path)
         output_df.to_pickle(output_path)
 
+        gc.collect()
+
         print("\n[FINAL] Saved outputs once at end.")
-        print(f"  ✓ Word2Vec model: {w2v_path}")
+        print(f"  ✓ Word2Vec keyed vectors: {w2v_path}")
         print(f"  ✓ Final dataset: {output_path}")
         print(f"  ✓ Final rows: {len(output_df)}")
         if not output_df.empty:
