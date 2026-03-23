@@ -1,296 +1,318 @@
 import os
 import re
+import gc
 import json
+import sys
+import shutil
 import argparse
 import subprocess
+import numpy as np
 import pandas as pd
-import multiprocessing
-from rich.progress import Progress
-from multiprocessing import Pool, cpu_count
-from rich.progress import Progress, BarColumn, TextColumn, TimeRemainingColumn
+from typing import Dict, List, Tuple, Any
 from concurrent.futures import ProcessPoolExecutor, as_completed, TimeoutError
+from rich.progress import Progress, BarColumn, TextColumn, TimeRemainingColumn
+
+# Compatibility shim for pickle files created under NumPy 2.x module paths.
+if "numpy._core" not in sys.modules:
+    sys.modules["numpy._core"] = np.core
+if "numpy._core.numeric" not in sys.modules:
+    sys.modules["numpy._core.numeric"] = np.core.numeric
 
 AVAILABLE_DATASETS = ["train", "valid", "test"]
-JOERN_CLI_DIR = "joern/joern-cli/"
+BASE_DIR = os.getcwd()
+JOERN_CLI_DIR = os.path.join(BASE_DIR, "joern", "joern-cli")
+GRAPH_SCRIPT_PATH = os.path.join(BASE_DIR, "joern", "graph-for-funcs.sc")
 PATHS = {
-        "cpg" : "tmp/cwe20cfa/cpg/",
-        "source" : "tmp/cwe20cfa/source/",
-        "input" : "tmp/cwe20cfa/input/",
-        "model" : "tmp/cwe20cfa/model/",
-        "tokens" : "tmp/tokens/",
-        "w2v" : "tmp/cwe20cfa/w2v/"
-    }
-MAX_RETRIES = 10 # Maximum retry attempts
-EXAMPLES_PER_SAVE = 1
-# Args
+    "cpg": os.path.join(BASE_DIR, "tmp", "cwe20cfa", "cpg"),
+    "source": os.path.join(BASE_DIR, "tmp", "cwe20cfa", "source"),
+    "input": os.path.join(BASE_DIR, "tmp", "cwe20cfa", "input"),
+    "model": os.path.join(BASE_DIR, "tmp", "cwe20cfa", "model"),
+    "tokens": os.path.join(BASE_DIR, "tmp", "tokens"),
+    "w2v": os.path.join(BASE_DIR, "tmp", "cwe20cfa", "w2v"),
+}
+
+DEFAULT_BATCH_SIZE = 50
+DEFAULT_WORKERS = max(1, (os.cpu_count() or 2) // 2)
+MAX_RETRIES = 3
+
+
 parser = argparse.ArgumentParser()
 parser.add_argument(
-    "-d", "--dataset",
+    "-d",
+    "--dataset",
     nargs="*",
     help="Select dataset(s). If not provided, all datasets are used.",
     choices=AVAILABLE_DATASETS,
-    default=AVAILABLE_DATASETS
+    default=AVAILABLE_DATASETS,
+)
+parser.add_argument(
+    "--batch-size",
+    type=int,
+    default=DEFAULT_BATCH_SIZE,
+    help="Number of samples per Joern batch.",
+)
+parser.add_argument(
+    "--workers",
+    type=int,
+    default=DEFAULT_WORKERS,
+    help="Number of worker processes. Recommended <= cpu_count()//2 due to Joern RAM usage.",
+)
+parser.add_argument(
+    "--timeout",
+    type=int,
+    default=900,
+    help="Timeout (seconds) per batch worker.",
 )
 args = parser.parse_args()
 
-def joern_parse(joern_cli_path, input_path, output_path, file_name):
-    """
-    Parses source code files into Joern's intermediate representation (Coded Property Graph - CPG).
-    
-    This function runs the `joern-parse` command-line tool to convert source code into a binary CPG file, 
-    which is later used for code analysis in Joern. The function executes the command using `subprocess.run` 
-    and returns the generated binary file's name.
 
-    Parameters:
-    - joern_cli_path (str): Path to the Joern CLI installation directory.
-    - input_path (str): Path to the directory containing the source code to be parsed.
-    - output_path (str): Path where the parsed CPG binary file should be saved.
-    - file_name (str): Base name for the output binary file (without extension).
+def ensure_directories_exist(paths: Dict[str, str]):
+    for path in paths.values():
+        os.makedirs(path, exist_ok=True)
 
-    Returns:
-    - str: The name of the generated binary file.
-    """
-    out_file = file_name + ".bin"
-    # Subprocess calling
-    joern_parse_call = subprocess.run(["./" + os.path.join(joern_cli_path, "joern-parse"), input_path, "--out", os.path.join(output_path, out_file)],
-                                      stdout=subprocess.PIPE, text=True, check=True)
-    # print(joern_parse_call.stdout)
-    
-    return out_file
 
-def joern_create(joern_path, in_path, out_path, cpg_file):
-    """
-    Executes a Joern script to extract function-level code property graphs (CPGs) 
-    and saves the results as a JSON file using direct communication with the process.
+def chunk_list(items: List[Any], chunk_size: int) -> List[List[Any]]:
+    return [items[i : i + chunk_size] for i in range(0, len(items), chunk_size)]
 
-    Instead of writing the script to a file, this function sends commands directly to 
-    the Joern process via `stdin`. It:
-    - Loads a previously generated CPG binary file.
-    - Runs a predefined Joern script (`graph-for-funcs.sc`) to extract function-level graph data.
-    - Exports the results to a JSON file.
 
-    Parameters:
-    - joern_path (str): Path to the Joern CLI installation directory.
-    - in_path (str): Path where the input CPG binary file is located.
-    - out_path (str): Directory where the generated JSON file should be stored.
-    - cpg_file (str): Name of the CPG binary file (e.g., "example.bin").
+def build_joern_script(cpg_bin_path: str, json_out_path: str, script_path: str):
+    with open(script_path, "w", encoding="utf-8") as script_file:
+        script_file.write(f'importCpg("{cpg_bin_path}")\n')
+        script_file.write(f'cpg.runScript("{GRAPH_SCRIPT_PATH}").toString() |> "{json_out_path}"\n')
+        script_file.write(f'delete("{os.path.basename(cpg_bin_path)}")\n')
 
-    Returns:
-    - str: The name of the generated JSON file.
-    """
 
-    # Generate JSON output file name
-    json_file = f"{cpg_file.split('.')[0]}.json"
+def run_joern_parse(input_dir: str, output_bin_path: str):
+    cmd = [
+        os.path.join(JOERN_CLI_DIR, "joern-parse"),
+        input_dir,
+        "--out",
+        output_bin_path,
+    ]
+    subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
 
-    # Path for temporary script with commands
-    if not os.path.exists("tmp"):
-        os.mkdir("tmp")
-        
-    commands_script__path = os.path.abspath("tmp/joern_temp_script.sc")
 
-    # Paths for script execution
-    graph_script_path = os.path.abspath("joern/graph-for-funcs.sc")
-    json_out = os.path.join(os.path.abspath(out_path), json_file)
-
-    # Write commands to the script file
-    with open(commands_script__path, 'w') as script_file:
-        # Import CPG project
-        script_file.write(f'importCpg("{os.path.abspath(in_path)}/{cpg_file}")\n')
-        # Generate json graph
-        script_file.write(f'cpg.runScript("{graph_script_path}").toString() |> "{json_out}"\n')
-        # Delete project
-        script_file.write(f'delete("{cpg_file}")\n')
-
-    # Set environment variables to avoid interactive mode
+def run_joern_script(script_path: str, timeout_seconds: int):
     env = os.environ.copy()
     env["JOERN_INTERACTIVE"] = "false"
+    cmd = [os.path.join(JOERN_CLI_DIR, "joern"), "--script", script_path]
+    subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        timeout=timeout_seconds,
+        check=True,
+    )
+
+
+def parse_batch_json(json_path: str) -> Dict[str, Dict[str, Any]]:
+    if not os.path.exists(json_path) or os.path.getsize(json_path) == 0:
+        return {}
+
+    with open(json_path, "r", encoding="utf-8") as jf:
+        cpg_string = jf.read()
+
+    cpg_string = re.sub(r"io\\.shiftleft\\.codepropertygraph\\.generated\\.", "", cpg_string)
+    payload = json.loads(cpg_string)
+
+    indexed: Dict[str, Dict[str, Any]] = {}
+    for graph in payload.get("functions", []):
+        file_path = graph.get("file")
+        if not file_path or file_path == "N/A":
+            continue
+
+        index_key = os.path.splitext(os.path.basename(file_path))[0]
+        if index_key in indexed:
+            # Keep first graph for consistency with old single-function flow.
+            continue
+
+        graph_copy = dict(graph)
+        graph_copy.pop("file", None)
+        indexed[index_key] = {"functions": [graph_copy]}
+
+    return indexed
+
+
+def cleanup_batch_artifacts(batch_source_dir: str, batch_bin_path: str, batch_json_path: str, batch_script_path: str):
+    shutil.rmtree(batch_source_dir, ignore_errors=True)
+    for path in [batch_bin_path, batch_json_path, batch_script_path]:
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+def process_batch(task: Tuple[str, List[Tuple[int, str]], int, int]):
+    """
+    Process one batch in one worker:
+    1) write .c files for the batch
+    2) run joern-parse once on the whole directory
+    3) run joern script once to export all functions as JSON
+    4) map JSON results back to original DataFrame indices
+    """
+    batch_id, batch_examples, max_retries, joern_timeout = task
+
+    batch_source_dir = os.path.join(PATHS["source"], f"batch_{batch_id}")
+    os.makedirs(batch_source_dir, exist_ok=True)
+
+    batch_bin_path = os.path.join(PATHS["cpg"], f"batch_{batch_id}.bin")
+    batch_json_path = os.path.join(PATHS["cpg"], f"batch_{batch_id}.json")
+    batch_script_path = os.path.join(BASE_DIR, "tmp", f"joern_batch_{batch_id}.sc")
+
+    id_to_index: Dict[str, int] = {}
 
     try:
-        # Run Joern process and communicate via stdin (forcing non-interactive mode)
-        joern_process = subprocess.Popen(
-            [os.path.join(joern_path, "joern"), "--script", commands_script__path],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=env,  # Pass modified environment variables
-            bufsize=1,  # Enable line-buffering
-        )
+        for index, code in batch_examples:
+            id_str = str(index)
+            id_to_index[id_str] = index
+            source_path = os.path.join(batch_source_dir, f"{id_str}.c")
+            with open(source_path, "w", encoding="utf-8") as f:
+                f.write(code)
 
-        outs, errs = joern_process.communicate(timeout=120)  # Waits for completion with a 120s timeout
-
-    except subprocess.TimeoutExpired:
-        joern_process.kill()  # Kill the stuck process
-        outs, errs = joern_process.communicate()  # Capture output after termination
-        print(f"[ERROR] Joern process timed out after 120 seconds.")
-
-    except Exception as e:
-        print(f"[ERROR] Joern process failed: {e}")
-
-    return json_file
-
-def graph_indexing(graph):
-    func_name = graph["file"].split(".c")[0].split("/")[-1]
-    del graph["file"]
-    return func_name, {"functions": [graph]}
-
-def json_process(in_path, json_file):
-    if os.path.exists(in_path+"/"+json_file):
-        with open(in_path+"/"+json_file) as jf:
-            cpg_string = jf.read()
-            cpg_string = re.sub(r"io\.shiftleft\.codepropertygraph\.generated\.", '', cpg_string)
-            cpg_json = json.loads(cpg_string)
-            container = [graph_indexing(graph) for graph in cpg_json["functions"] if graph["file"] != "N/A"]
-            return container
-    return None
-
-def process_example(args):
-    index, example, paths, joern_cli_dir, max_retries = args
-
-    # Skip if already processed
-    if not pd.isna(example["orig_cpg"]):
-        return index, example["orig_cpg"]
-
-    try:
-        # -------------------------------
-        # Step 2: Code Parsing
-        source_file_path = os.path.join(paths["source"], f"{index}.c")
-        with open(source_file_path, 'w') as f:
-            f.write(example.orig_func)
-
-        cpg_file = joern_parse(joern_cli_dir, source_file_path, paths['cpg'], f"{index}_cpg")
-
-        # -------------------------------
-        # Step 3: Create CPG graphs JSON file (retry separately)
+        last_error = None
         for attempt in range(1, max_retries + 1):
             try:
-                json_file = joern_create(joern_cli_dir, paths['cpg'], paths['cpg'], cpg_file)
-                if os.path.exists(os.path.join(paths['cpg'],json_file)) and os.path.getsize(os.path.join(paths['cpg'],json_file)) > 0:
-                    break  # Success, exit retry loop
-                else:
-                    raise Exception(f"Empty or missing JSON file after attempt {attempt}")
-            except Exception as e:
+                run_joern_parse(batch_source_dir, batch_bin_path)
+                build_joern_script(batch_bin_path, batch_json_path, batch_script_path)
+                run_joern_script(batch_script_path, joern_timeout)
+                break
+            except Exception as err:
+                last_error = err
                 if attempt == max_retries:
-                    print(f"[ERROR] Failed Step 3 for example {index}. Max retries reached ({max_retries}). Skipping this example.")
-                    
-                    # Cleanup temporary files
-                    for filename in [f"{index}_cpg.bin", f"{index}_cpg.json"]:
-                        filepath = os.path.join(paths['source'], f"{index}.c")
-                        if os.path.exists(filepath):
-                            os.remove(filepath)
-                        filepath = os.path.join(paths['cpg'], filename)
-                        if os.path.exists(filepath):
-                            os.remove(filepath)
-                    
-                    return index, None
+                    raise
 
-        # -------------------------------
-        # Step 4: Process CPG (retry separately)
-        for attempt in range(1, max_retries + 1):
-            try:
-                graphs = json_process(paths['cpg'], json_file)
-                if graphs and isinstance(graphs, list) and len(graphs) > 0 and len(graphs[0]) > 1:
-                    cpg = graphs[0][1]  # Extract CPG
-                    break  # Success, exit retry loop
-                else:
-                    raise Exception(f"Invalid graphs output after attempt {attempt}")
-            except Exception as e:
-                if attempt == max_retries:
-                    print(f"[ERROR] Failed Step 4 for example {index}. Max retries reached ({max_retries}). Skipping this example.")
-                    
-                    # Cleanup temporary files
-                    for filename in [f"{index}_cpg.bin", f"{index}_cpg.json"]:
-                        filepath = os.path.join(paths['source'], f"{index}.c")
-                        if os.path.exists(filepath):
-                            os.remove(filepath)
-                        filepath = os.path.join(paths['cpg'], filename)
-                        if os.path.exists(filepath):
-                            os.remove(filepath)         
-                    
-                    return index, None
+        indexed_graphs = parse_batch_json(batch_json_path)
 
-        # Cleanup temporary files
-        for filename in [f"{index}_cpg.bin", f"{index}_cpg.json"]:
-            filepath = os.path.join(paths['source'], f"{index}.c")
-            if os.path.exists(filepath):
-                os.remove(filepath)
-            filepath = os.path.join(paths['cpg'], filename)
-            if os.path.exists(filepath):
-                os.remove(filepath)
+        success_map: Dict[int, Dict[str, Any]] = {}
+        failed_indices: List[int] = []
 
-        print(f"CPG generated for example {index}.")
-        return index, cpg  # Successful processing
+        for id_str, index in id_to_index.items():
+            cpg = indexed_graphs.get(id_str)
+            if cpg is None:
+                failed_indices.append(index)
+            else:
+                success_map[index] = cpg
+
+        return {
+            "batch_id": batch_id,
+            "success_map": success_map,
+            "failed_indices": failed_indices,
+            "error": str(last_error) if (not success_map and last_error is not None) else None,
+        }
 
     except Exception as e:
-        print(f"[ERROR] Example {index} - Unhandled failure: {e}")
-        return index, None  # Fail-safe return
+        return {
+            "batch_id": batch_id,
+            "success_map": {},
+            "failed_indices": [index for index, _ in batch_examples],
+            "error": str(e),
+        }
+    finally:
+        cleanup_batch_artifacts(batch_source_dir, batch_bin_path, batch_json_path, batch_script_path)
+        gc.collect()
+
+
+def build_pending_examples(dataset_df: pd.DataFrame) -> List[Tuple[int, str]]:
+    pending = []
+    for index, row in dataset_df[pd.isna(dataset_df["orig_cpg"])].iterrows():
+        pending.append((index, row["orig_func"]))
+    return pending
+
 
 if __name__ == "__main__":
+    ensure_directories_exist(PATHS)
+
     for dataset in args.dataset:
         print(f"\nGenerating CPG for {dataset.upper()} dataset")
-        print("-----------------------------------------")
+        print("-" * 41)
 
         dataset_path = f"datasets/cwe20cfa/cwe20cfa_CWE-20_augmented_{dataset}.pkl"
         print(dataset_path)
-        filepath = os.path.join(os.getcwd(), dataset_path)
+        filepath = os.path.join(BASE_DIR, dataset_path)
+
         dataset_df = pd.read_pickle(filepath)
-        try:
-            dataset_df["orig_cpg"] = dataset_df["orig_cpg"].astype(object)
-        except KeyError:
+        if "orig_cpg" not in dataset_df.columns:
             dataset_df["orig_cpg"] = pd.NA
+        dataset_df["orig_cpg"] = dataset_df["orig_cpg"].astype(object)
 
-        # Select only rows that still need processing (e.g., where "cpg" is NaN)
-        filtered_df = dataset_df[pd.isna(dataset_df["orig_cpg"])]
-        task_list = [(index, row, PATHS, JOERN_CLI_DIR, MAX_RETRIES) for index, row in filtered_df.iterrows()]
+        pending_examples = build_pending_examples(dataset_df)
+        if not pending_examples:
+            print("No pending rows. Dataset already has orig_cpg for all samples.")
+            continue
 
-        num_workers = max(1,1)
-        # num_workers = max(1, int(multiprocessing.cpu_count()/2))  # Use half of available CPUs, leaving one free
-        timeout_per_task = 60  # seconds, adjust as needed
+        batch_size = max(1, args.batch_size)
+        workers = max(1, args.workers)
+        batches = chunk_list(pending_examples, batch_size)
 
-        # Setup rich progress bar
+        print(f"Pending rows: {len(pending_examples)}")
+        print(f"Batch size: {batch_size}")
+        print(f"Total batches: {len(batches)}")
+        print(f"Workers: {workers}")
+
+        task_list: List[Tuple[str, List[Tuple[int, str]], int, int]] = []
+        for batch_idx, batch_examples in enumerate(batches):
+            task_list.append((f"{dataset}_{batch_idx}", batch_examples, MAX_RETRIES, args.timeout))
+
+        completed_batches = 0
+        dropped_rows = 0
+
         with Progress(
-            TextColumn("[bold magenta]Processing {task.fields[dataset]} ({task.completed}/{task.total})..."),
+            TextColumn("[bold magenta]Processing {task.fields[dataset]} batches ({task.completed}/{task.total})..."),
             BarColumn(),
             TextColumn("[bold cyan]{task.percentage:>3.1f}%"),
             TimeRemainingColumn(),
         ) as progress:
             main_task = progress.add_task(
-                f"[magenta]Processing {dataset.upper()} dataset", 
+                f"[magenta]Processing {dataset.upper()} batch jobs",
                 total=len(task_list),
-                dataset=dataset.upper()
+                dataset=dataset.upper(),
             )
 
-            results = {}
-            with ProcessPoolExecutor(max_workers=num_workers) as executor:
-                futures = {executor.submit(process_example, task): task[0] for task in task_list}
+            with ProcessPoolExecutor(max_workers=workers) as executor:
+                futures = {executor.submit(process_batch, task): task[0] for task in task_list}
 
-                i = 0
                 for future in as_completed(futures):
-                    index = futures[future]
+                    batch_id = futures[future]
                     try:
-                        idx, cpg = future.result(timeout=timeout_per_task)
-
-                        if cpg is not None:
-                            dataset_df.at[idx, "orig_cpg"] = cpg  # Assign as dict directly
-                        else:
-                            dataset_df.drop(index=idx, inplace=True)  # Drop failed row
-
-                        i += 1
-                        progress.update(main_task, advance=1)
-                        progress.refresh()
-
-                        # Save dataset every X examples
-                        if i % EXAMPLES_PER_SAVE == 0:
-                            dataset_df.to_pickle(filepath)
-                            print(f"Saved dataset at {filepath}")
-                        
+                        result = future.result(timeout=args.timeout + 120)
                     except TimeoutError:
-                        print(f"[ERROR] Example {index} timed out. Skipping this example.")
-                        continue
+                        batch_examples = next((t[1] for t in task_list if t[0] == batch_id), [])
+                        failed_indices = [idx for idx, _ in batch_examples]
+                        dataset_df = dataset_df.drop(index=failed_indices, errors="ignore")
+                        dropped_rows += len(failed_indices)
+                        print(f"[ERROR] Batch {batch_id} timed out. Dropped {len(failed_indices)} rows.")
                     except Exception as e:
-                        print(f"[ERROR] Example {index} raised an exception: {e}")
-                        continue
+                        batch_examples = next((t[1] for t in task_list if t[0] == batch_id), [])
+                        failed_indices = [idx for idx, _ in batch_examples]
+                        dataset_df = dataset_df.drop(index=failed_indices, errors="ignore")
+                        dropped_rows += len(failed_indices)
+                        print(f"[ERROR] Batch {batch_id} crashed: {e}. Dropped {len(failed_indices)} rows.")
+                    else:
+                        success_map = result.get("success_map", {})
+                        failed_indices = result.get("failed_indices", [])
 
-        # Save the final dataset after all processing is complete
+                        for idx, cpg in success_map.items():
+                            dataset_df.at[idx, "orig_cpg"] = cpg
+
+                        if failed_indices:
+                            dataset_df = dataset_df.drop(index=failed_indices, errors="ignore")
+                            dropped_rows += len(failed_indices)
+
+                        if result.get("error"):
+                            print(f"[WARN] Batch {batch_id}: {result['error']}")
+
+                    completed_batches += 1
+                    progress.update(main_task, advance=1)
+                    progress.refresh()
+
+                    # Save once per completed batch to avoid per-example I/O bottleneck.
+                    dataset_df.to_pickle(filepath)
+                    print(f"Saved dataset after batch {completed_batches}/{len(task_list)} at {filepath}")
+
         dataset_df.to_pickle(filepath)
-        print(f"Final dataset saved at {filepath}")
+        print(f"\nFinal dataset saved at {filepath}")
+        print(f"Dropped rows: {dropped_rows}")
+        print(f"Remaining rows: {len(dataset_df)}")
