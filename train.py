@@ -8,12 +8,12 @@ if os.getcwd() not in sys.path:
 import torch
 import subprocess
 import numpy as np
-# Compatibility shim WITHOUT importing numpy.core directly if possible or using dummy for segmentation fixed
-class DummyCoreNumeric:
-    pass
-sys.modules["numpy._core.numeric"] = DummyCoreNumeric
-sys.modules["numpy._core"] = DummyCoreNumeric
-sys.modules["numpy._core.multiarray"] = DummyCoreNumeric
+
+# Compatibility shim for pickle files created under NumPy 2.x module paths.
+if "numpy._core" not in sys.modules:
+    sys.modules["numpy._core"] = np.core
+if "numpy._core.numeric" not in sys.modules:
+    sys.modules["numpy._core.numeric"] = np.core.numeric
 
 import pandas as pd
 from tqdm import tqdm
@@ -307,8 +307,8 @@ def eval_model(model, dataloader, threshold=0.5, test=False):
     precision = metrics.precision_score(y_true=labels, y_pred=predicts, zero_division=0)
     recall = metrics.recall_score(y_true=labels, y_pred=predicts)
 
-    # Compute confusion matrix (always 2x2 even if one class is missing)
-    confusion = confusion_matrix(y_true=labels, y_pred=predicts, labels=[0, 1])
+    # Compute confusion matrix
+    confusion = confusion_matrix(y_true=labels, y_pred=predicts)
     tn, fp, fn, tp = confusion.ravel()
     
     print(f"\nConfusion matrix: \n{confusion}")
@@ -369,34 +369,6 @@ def create_balanced_symmetric_benchmark_split(df, orig_frac, size=10000, random_
         benign_df = source_df[source_df['target'] == 0]
         vuln_df = source_df[source_df['target'] == 1]
 
-        # Check for empty DataFrames and provide warnings
-        if len(benign_df) == 0:
-            print(f"[WARNING] No benign samples (target=0) found for orig_frac={orig_frac}. Using only vulnerable samples.")
-            benign_df = pd.DataFrame(columns=source_df.columns)
-        if len(vuln_df) == 0:
-            print(f"[WARNING] No vulnerable samples (target=1) found for orig_frac={orig_frac}. Using only benign samples.")
-            vuln_df = pd.DataFrame(columns=source_df.columns)
-
-        # Calculate half_N safely based on available classes
-        if len(benign_df) == 0 and len(vuln_df) == 0:
-            print(f"[ERROR] No samples available for orig_frac={orig_frac}.")
-            return pd.DataFrame(columns=source_df.columns)
-        elif len(benign_df) == 0:
-            # Only vulnerable samples available
-            if len(vuln_df) < N:
-                vuln_df = resample(vuln_df, replace=True, n_samples=N, random_state=random_state)
-            else:
-                vuln_df = vuln_df.sample(n=N, random_state=random_state)
-            return vuln_df.sample(frac=1, random_state=random_state).reset_index(drop=True)
-        elif len(vuln_df) == 0:
-            # Only benign samples available
-            if len(benign_df) < N:
-                benign_df = resample(benign_df, replace=True, n_samples=N, random_state=random_state)
-            else:
-                benign_df = benign_df.sample(n=N, random_state=random_state)
-            return benign_df.sample(frac=1, random_state=random_state).reset_index(drop=True)
-
-        # Both classes available - proceed with normal balanced sampling
         half_N = N // 2
         if len(benign_df) < half_N:
             benign_df = resample(benign_df, replace=True, n_samples=half_N, random_state=random_state)
@@ -446,43 +418,21 @@ def create_balanced_symmetric_benchmark_split(df, orig_frac, size=10000, random_
     n_remaining = N - 2 * M
     n_half = n_remaining // 2
 
-    # Check for empty DataFrames and handle gracefully
-    if len(benign_df) == 0 and len(vuln_df) == 0:
-        print(f"[WARNING] No additional samples available for orig_frac={orig_frac}. Benchmark may be smaller than requested.")
-        step3_df = pd.DataFrame(columns=candidate_df.columns)
-    elif len(benign_df) == 0:
-        print(f"[WARNING] No benign samples (target=0) in remaining pool for orig_frac={orig_frac}. Using only vulnerable samples.")
-        # Only vulnerable samples available - use all remaining for vulnerable
-        if len(vuln_df) < n_remaining:
-            vuln_extra = resample(vuln_df, replace=True, n_samples=n_remaining, random_state=random_state)
-        else:
-            vuln_extra = vuln_df.sample(n=n_remaining, random_state=random_state)
-        step3_df = vuln_extra
-    elif len(vuln_df) == 0:
-        print(f"[WARNING] No vulnerable samples (target=1) in remaining pool for orig_frac={orig_frac}. Using only benign samples.")
-        # Only benign samples available - use all remaining for benign
-        if len(benign_df) < n_remaining:
-            benign_extra = resample(benign_df, replace=True, n_samples=n_remaining, random_state=random_state + 1)
-        else:
-            benign_extra = benign_df.sample(n=n_remaining, random_state=random_state + 1)
-        step3_df = benign_extra
+    if len(benign_df) < n_half:
+        benign_extra = resample(benign_df, replace=True, n_samples=n_half, random_state=random_state + 1)
     else:
-        # Both classes available - proceed with balanced sampling
-        if len(benign_df) < n_half:
-            benign_extra = resample(benign_df, replace=True, n_samples=n_half, random_state=random_state + 1)
-        else:
-            benign_extra = benign_df.sample(n=n_half, random_state=random_state + 1)
+        benign_extra = benign_df.sample(n=n_half, random_state=random_state + 1)
 
-        if len(vuln_df) < n_half:
-            vuln_extra = resample(vuln_df, replace=True, n_samples=n_half, random_state=random_state)
-        else:
-            vuln_extra = vuln_df.sample(n=n_half, random_state=random_state)
+    if len(vuln_df) < n_half:
+        vuln_extra = resample(vuln_df, replace=True, n_samples=n_half, random_state=random_state)
+    else:
+        vuln_extra = vuln_df.sample(n=n_half, random_state=random_state)
 
-        if n_remaining % 2 == 1:
-            extra_sample = pd.concat([benign_df, vuln_df]).sample(1, random_state=random_state + 2)
-            step3_df = pd.concat([benign_extra, vuln_extra, extra_sample], ignore_index=True)
-        else:
-            step3_df = pd.concat([benign_extra, vuln_extra], ignore_index=True)
+    if n_remaining % 2 == 1:
+        extra_sample = pd.concat([benign_df, vuln_df]).sample(1, random_state=random_state + 2)
+        step3_df = pd.concat([benign_extra, vuln_extra, extra_sample], ignore_index=True)
+    else:
+        step3_df = pd.concat([benign_extra, vuln_extra], ignore_index=True)
 
     # Combine all and shuffle
     full_df = pd.concat([step1_df, step2_df, step3_df], ignore_index=True)
@@ -606,7 +556,7 @@ if __name__ == "__main__":
     print("-----------------------------------------")
     print("Loading...")
     # TRAIN
-    dataset_df = pd.read_pickle('datasets/cwe20cfa/cwe20cfa_CWE-20_augmented_input_strictly_balanced.pkl')
+    dataset_df = pd.read_pickle('datasets/cwe20cfa/cwe20cfa_CWE-20_augmented_input_balanced.pkl')
     print(f"Dataset loaded. {len(dataset_df)} examples")
     print(dataset_df['target'].value_counts())
 
