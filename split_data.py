@@ -94,6 +94,7 @@ def main() -> None:
     print(f"Loaded {len(df)} rows")
 
     validate_columns(df, args.input_col, args.target_col, args.id_col)
+    has_adv = "adv" in df.columns
 
     records = []
     skipped = 0
@@ -111,17 +112,27 @@ def main() -> None:
                 "target": target,
                 "id": sample_id,
             }
+            adv_value = None
+            if has_adv:
+                adv_value = bool(getattr(row, "adv"))
+                sample["adv"] = adv_value
 
             filename = f"sample_{i}.pt"
             file_path = os.path.join(args.output_dir, filename)
 
             if not args.overwrite and os.path.exists(file_path):
-                records.append({"sample_index": i, "filename": filename, "id": sample_id, "target": target})
+                record = {"sample_index": i, "filename": filename, "id": sample_id, "target": target}
+                if has_adv:
+                    record["adv"] = adv_value
+                records.append(record)
                 continue
 
             # Keep tensors on CPU and use protocol 4 for broad compatibility.
             torch.save(sample, file_path, pickle_protocol=4)
-            records.append({"sample_index": i, "filename": filename, "id": sample_id, "target": target})
+            record = {"sample_index": i, "filename": filename, "id": sample_id, "target": target}
+            if has_adv:
+                record["adv"] = adv_value
+            records.append(record)
 
             if (i + 1) % max(1, args.gc_every) == 0:
                 gc.collect()

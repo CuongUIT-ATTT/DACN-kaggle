@@ -101,14 +101,17 @@ def select_best_gpu():
 DEVICE = torch.device(f"cuda:{select_best_gpu()}") if torch.cuda.is_available() else "cpu"
 
 class DevignDataset(Dataset):
-    def __init__(self, dataset_source, index_file=None, max_load_retries=3):
+    def __init__(self, dataset_source, index_file=None, index_df=None, max_load_retries=3):
         self.max_load_retries = max_load_retries
         self.mode = "pt_dir" if isinstance(dataset_source, str) else "dataframe"
 
         if self.mode == "pt_dir":
             self.data_dir = dataset_source
             self.index_file = index_file or os.path.join(self.data_dir, "index.csv")
-            self.samples = self._build_sample_index()
+            if index_df is not None:
+                self.samples = self._build_sample_index_from_df(index_df)
+            else:
+                self.samples = self._build_sample_index()
             self.targets = [int(item["target"]) for item in self.samples]
         else:
             # Backward-compatible path for existing code that still passes a DataFrame.
@@ -180,16 +183,7 @@ class DevignDataset(Dataset):
             if not required_cols.issubset(index_df.columns):
                 raise ValueError(f"Index file missing columns {required_cols}: {self.index_file}")
 
-            samples = []
-            for row in index_df.itertuples(index=False):
-                filename = str(row.filename)
-                file_path = os.path.join(self.data_dir, filename)
-                if os.path.exists(file_path):
-                    samples.append({
-                        "file_path": file_path,
-                        "target": int(row.target),
-                        "id": str(row.id),
-                    })
+            samples = self._build_sample_index_from_df(index_df)
             if samples:
                 return samples
 
@@ -219,6 +213,24 @@ class DevignDataset(Dataset):
 
         if not samples:
             raise RuntimeError(f"Unable to index valid .pt samples in: {self.data_dir}")
+        return samples
+
+    def _build_sample_index_from_df(self, index_df: pd.DataFrame):
+        required_cols = {"filename", "target", "id"}
+        if not required_cols.issubset(index_df.columns):
+            raise ValueError(f"Index DataFrame missing columns: {required_cols}")
+
+        samples = []
+        for row in index_df.itertuples(index=False):
+            filename = str(row.filename)
+            file_path = os.path.join(self.data_dir, filename)
+            if os.path.exists(file_path):
+                samples.append({
+                    "file_path": file_path,
+                    "target": int(row.target),
+                    "id": str(row.id),
+                })
+
         return samples
 
     def set_sampler(self):
@@ -677,6 +689,91 @@ def split_indices_by_id(index_df: pd.DataFrame, test_size=0.1, val_size=0.1, ran
     return train_indices, val_indices, test_indices
 
 
+def infer_adv_column(index_df: pd.DataFrame) -> pd.Series:
+    """
+    Return a boolean Series where True means counterexample and False means original.
+    """
+    if "adv" in index_df.columns:
+        raw = index_df["adv"]
+        if pd.api.types.is_bool_dtype(raw):
+            return raw.fillna(False).astype(bool)
+
+        norm = raw.astype(str).str.strip().str.lower()
+        true_vals = {"1", "true", "t", "yes", "y", "adv", "counterexample", "counter", "ce"}
+        false_vals = {"0", "false", "f", "no", "n", "orig", "original"}
+        mapped = norm.map(lambda x: True if x in true_vals else (False if x in false_vals else np.nan))
+        if mapped.isna().any():
+            raise ValueError("Column 'adv' contains unknown values. Please normalize it to True/False.")
+        return mapped.astype(bool)
+
+    id_text = index_df["id"].astype(str).str.lower() if "id" in index_df.columns else ""
+    file_text = index_df["filename"].astype(str).str.lower() if "filename" in index_df.columns else ""
+    text = id_text + " " + file_text
+
+    inferred = np.where(
+        text.str.contains(r"adv|counterexample|counter|_ce\b|\bce\b", regex=True),
+        True,
+        np.where(text.str.contains(r"orig|original", regex=True), False, np.nan),
+    )
+    inferred = pd.Series(inferred, index=index_df.index)
+
+    if inferred.isna().any():
+        raise ValueError(
+            "Cannot infer original/counterexample from index.csv. "
+            "Please regenerate processed_data/index.csv with an explicit 'adv' column."
+        )
+
+    return inferred.astype(bool)
+
+
+def sample_balanced_from_pool(pool_df: pd.DataFrame, n_samples: int, random_state: int) -> pd.DataFrame:
+    if n_samples <= 0:
+        return pool_df.iloc[0:0].copy()
+    if len(pool_df) == 0:
+        return pool_df.copy()
+
+    # Keep target balance close to 50/50 while sampling from each pool.
+    if "target" in pool_df.columns:
+        class0 = pool_df[pool_df["target"] == 0]
+        class1 = pool_df[pool_df["target"] == 1]
+
+        n0 = n_samples // 2
+        n1 = n_samples - n0
+
+        if len(class0) == 0 or len(class1) == 0:
+            replace = len(pool_df) < n_samples
+            return pool_df.sample(n=n_samples, replace=replace, random_state=random_state)
+
+        s0 = class0.sample(n=n0, replace=len(class0) < n0, random_state=random_state)
+        s1 = class1.sample(n=n1, replace=len(class1) < n1, random_state=random_state + 1)
+        return pd.concat([s0, s1], ignore_index=False).sample(frac=1, random_state=random_state + 2)
+
+    replace = len(pool_df) < n_samples
+    return pool_df.sample(n=n_samples, replace=replace, random_state=random_state)
+
+
+def build_lazy_benchmark_split(split_df: pd.DataFrame, orig_frac: float, random_state: int) -> pd.DataFrame:
+    if not 0.0 <= orig_frac <= 1.0:
+        raise ValueError("orig_frac must be in [0, 1]")
+
+    split_df = split_df.copy()
+    split_df["adv"] = infer_adv_column(split_df)
+
+    orig_df = split_df[split_df["adv"] == False]
+    ce_df = split_df[split_df["adv"] == True]
+
+    n_total = len(split_df)
+    n_orig = int(round(n_total * orig_frac))
+    n_ce = n_total - n_orig
+
+    selected_orig = sample_balanced_from_pool(orig_df, n_orig, random_state=random_state)
+    selected_ce = sample_balanced_from_pool(ce_df, n_ce, random_state=random_state + 17)
+
+    result = pd.concat([selected_orig, selected_ce], ignore_index=False)
+    result = result.sample(frac=1, random_state=random_state + 33).reset_index(drop=True)
+    return result
+
+
 def run_lazy_training(processed_dir: str, index_csv: str):
     """
     Train Devign directly from split .pt files using lazy loading.
@@ -700,27 +797,11 @@ def run_lazy_training(processed_dir: str, index_csv: str):
 
     print(f"Split sizes -> train: {len(train_indices)}, valid: {len(val_indices)}, test: {len(test_indices)}")
 
-    full_dataset = DevignDataset(processed_dir, index_file=index_csv)
-    train_dataset = Subset(full_dataset, train_indices)
-    val_dataset = Subset(full_dataset, val_indices)
-    test_dataset = Subset(full_dataset, test_indices)
+    train_base_df = index_df.loc[train_indices].reset_index(drop=True)
+    val_base_df = index_df.loc[val_indices].reset_index(drop=True)
+    test_base_df = index_df.loc[test_indices].reset_index(drop=True)
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=PROCESS["batch_size"],
-        shuffle=True,
-        num_workers=4,
-        pin_memory=torch.cuda.is_available(),
-        persistent_workers=True,
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=PROCESS["batch_size"],
-        shuffle=False,
-        num_workers=2,
-        pin_memory=torch.cuda.is_available(),
-        persistent_workers=True,
-    )
+    test_dataset = DevignDataset(processed_dir, index_df=test_base_df)
     test_loader = DataLoader(
         test_dataset,
         batch_size=PROCESS["batch_size"],
@@ -730,110 +811,162 @@ def run_lazy_training(processed_dir: str, index_csv: str):
         persistent_workers=True,
     )
 
-    model = Devign(
-        gated_graph_conv_args={
-            'out_channels': 200,
-            'num_layers': 6,
-            'aggr': 'add',
-            'bias': True
-        },
-        conv_args={
-            'conv1d_1': {
-                'in_channels': 205,
-                'out_channels': 50,
-                'kernel_size': 3,
-                'padding': 1
-            },
-            'conv1d_2': {
-                'in_channels': 50,
-                'out_channels': 20,
-                'kernel_size': 1,
-                'padding': 1
-            },
-            'maxpool1d_1': {
-                'kernel_size': 3,
-                'stride': 2
-            },
-            'maxpool1d_2': {
-                'kernel_size': 2,
-                'stride': 2
-            }
-        },
-        emb_size=101
-    )
+    benchmark_splits = [(100 - i, i) for i in range(0, 110, 10)]
+    metrics_rows = []
 
-    learning_rate = 5e-4
-    weight_decay = 1e-05
-    loss_lambda = 1e-06
-    loss_fc = lambda o, t: F.binary_cross_entropy_with_logits(o, t) + F.l1_loss(o, t) * loss_lambda
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    for orig_pct, adv_pct in benchmark_splits:
+        key = f"{orig_pct}_{adv_pct}"
+        print(f"\nBenchmark {key}")
+        print("-----------------------------------------")
 
-    model.to(DEVICE)
+        benchmark_train_df = build_lazy_benchmark_split(train_base_df, orig_frac=orig_pct / 100.0, random_state=SEED)
+        benchmark_valid_df = build_lazy_benchmark_split(val_base_df, orig_frac=orig_pct / 100.0, random_state=SEED + 101)
 
-    early_stop_count = 0
-    early_stop = int(PROCESS['epochs'] / 2)
-    best_loss = float('inf')
-    best_acc = 0
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', patience=5, factor=0.5)
-    THRESHOLD = 0.5
-    model_save_path = "benchmarks/devign_Accuracy_lazy.pt"
+        train_dataset = DevignDataset(processed_dir, index_df=benchmark_train_df)
+        val_dataset = DevignDataset(processed_dir, index_df=benchmark_valid_df)
 
-    for epoch in range(PROCESS['epochs']):
-        train_acc_list = []
-        train_loss_list = []
-
-        model.train()
-        for batch in tqdm(train_loader, desc=f"Train Epoch {epoch+1}"):
-            input_graph = batch["input"].to(DEVICE)
-            logit = model(input_graph)
-            loss = loss_fc(logit, input_graph.y)
-
-            optimizer.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-            optimizer.step()
-
-            preds = (logit >= THRESHOLD).float().cpu().numpy()
-            acc = binary_accuracy(torch.tensor(preds), input_graph.y.cpu())
-
-            train_acc_list.append(acc)
-            train_loss_list.append(loss.item())
-
-        train_acc = np.mean(train_acc_list)
-        train_loss = np.mean(train_loss_list)
-        val_metrics = eval_model(model, val_loader, threshold=THRESHOLD)
-
-        print(f"Epoch {epoch+1}: train_acc={train_acc:.4f}, train_loss={train_loss:.4f}, val_acc={val_metrics['Accuracy']:.4f}, val_loss={val_metrics['Loss']:.4f}")
-
-        scheduler.step(val_metrics["Accuracy"])
-
-        is_best = (val_metrics["Accuracy"] > best_acc) or (
-            val_metrics["Loss"] < best_loss and val_metrics["Accuracy"] >= best_acc
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=PROCESS["batch_size"],
+            shuffle=True,
+            num_workers=4,
+            pin_memory=torch.cuda.is_available(),
+            persistent_workers=True,
         )
-        if is_best:
-            best_acc = val_metrics["Accuracy"]
-            best_loss = val_metrics["Loss"]
-            early_stop_count = 0
-            torch.save(model.state_dict(), model_save_path)
-            print(f"Saved model: {model_save_path}")
-        else:
-            early_stop_count += 1
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=PROCESS["batch_size"],
+            shuffle=False,
+            num_workers=2,
+            pin_memory=torch.cuda.is_available(),
+            persistent_workers=True,
+        )
 
-        if early_stop_count > early_stop:
-            print("Early stopping triggered.")
-            break
+        model = Devign(
+            gated_graph_conv_args={
+                'out_channels': 200,
+                'num_layers': 6,
+                'aggr': 'add',
+                'bias': True
+            },
+            conv_args={
+                'conv1d_1': {'in_channels': 205, 'out_channels': 50, 'kernel_size': 3, 'padding': 1},
+                'conv1d_2': {'in_channels': 50, 'out_channels': 20, 'kernel_size': 1, 'padding': 1},
+                'maxpool1d_1': {'kernel_size': 3, 'stride': 2},
+                'maxpool1d_2': {'kernel_size': 2, 'stride': 2}
+            },
+            emb_size=101
+        )
 
-    model.load_state_dict(torch.load(model_save_path, map_location=DEVICE))
-    model.eval()
-    test_metrics = eval_model(model, test_loader, test=True)
-    print(
-        f"Test: Acc={test_metrics['Accuracy']:.4f}, Loss={test_metrics['Loss']:.4f}, "
-        f"Precision={test_metrics['Precision']:.4f}, Recall={test_metrics['Recall']:.4f}"
-    )
+        learning_rate = 5e-4
+        weight_decay = 1e-05
+        loss_lambda = 1e-06
+        loss_fc = lambda o, t: F.binary_cross_entropy_with_logits(o, t) + F.l1_loss(o, t) * loss_lambda
+        optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
-    metrics_df = pd.DataFrame([test_metrics])
-    metrics_df.to_csv("benchmarks/lazy_metrics.csv", index=False)
-    print("Saved test metrics to benchmarks/lazy_metrics.csv")
+        model.to(DEVICE)
+
+        early_stop_count = 0
+        early_stop = int(PROCESS['epochs'] / 2)
+        best_loss = float('inf')
+        best_acc = 0
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', patience=5, factor=0.5)
+        THRESHOLD = 0.5
+        model_save_path = f"benchmarks/devign_Accuracy_{key}.pt"
+
+        train_acc_history = []
+        val_acc_history = []
+        val_target_history = []
+        epochs_history = []
+        last_saved_epoch = None
+
+        for epoch in range(PROCESS['epochs']):
+            train_acc_list = []
+            train_loss_list = []
+
+            model.train()
+            for batch in tqdm(train_loader, desc=f"Train {key} Epoch {epoch+1}"):
+                input_graph = batch["input"].to(DEVICE)
+                logit = model(input_graph)
+                loss = loss_fc(logit, input_graph.y)
+
+                optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                optimizer.step()
+
+                preds = (logit >= THRESHOLD).float().cpu().numpy()
+                acc = binary_accuracy(torch.tensor(preds), input_graph.y.cpu())
+                train_acc_list.append(acc)
+                train_loss_list.append(loss.item())
+
+            train_acc = np.mean(train_acc_list)
+            train_loss = np.mean(train_loss_list)
+            val_metrics = eval_model(model, val_loader, threshold=THRESHOLD)
+
+            train_acc_history.append(train_acc)
+            val_acc_history.append(val_metrics["Accuracy"])
+            val_target_history.append(val_metrics["Accuracy"])
+            epochs_history.append(epoch + 1)
+
+            print(
+                f"Epoch {epoch+1}: train_acc={train_acc:.4f}, train_loss={train_loss:.4f}, "
+                f"val_acc={val_metrics['Accuracy']:.4f}, val_loss={val_metrics['Loss']:.4f}"
+            )
+
+            scheduler.step(val_metrics["Accuracy"])
+
+            is_best = (val_metrics["Accuracy"] > best_acc) or (
+                val_metrics["Loss"] < best_loss and val_metrics["Accuracy"] >= best_acc
+            )
+            if is_best:
+                best_acc = val_metrics["Accuracy"]
+                best_loss = val_metrics["Loss"]
+                early_stop_count = 0
+                last_saved_epoch = epoch + 1
+                torch.save(model.state_dict(), model_save_path)
+                print(f"Saved model: {model_save_path}")
+            else:
+                early_stop_count += 1
+
+            if early_stop_count > early_stop:
+                print("Early stopping triggered.")
+                break
+
+        plt.figure(figsize=(12, 8))
+        plt.plot(epochs_history, train_acc_history, label="Train Accuracy", marker="o")
+        plt.plot(epochs_history, val_acc_history, label="Validation Accuracy", marker="s")
+        plt.plot(epochs_history, val_target_history, label="Validation Accuracy (Target)", marker="d")
+        plt.xlabel("Epochs")
+        plt.ylabel("Performance")
+        plt.title(f"Training vs Validation ({key})")
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(f"benchmarks/training_{key}.png")
+        plt.close()
+
+        model.load_state_dict(torch.load(model_save_path, map_location=DEVICE))
+        model.eval()
+        test_metrics = eval_model(model, test_loader, test=True)
+        print(
+            f"Test {key}: Acc={test_metrics['Accuracy']:.4f}, Loss={test_metrics['Loss']:.4f}, "
+            f"Precision={test_metrics['Precision']:.4f}, Recall={test_metrics['Recall']:.4f}"
+        )
+
+        row = {
+            "benchmark": key,
+            "train_samples": len(benchmark_train_df),
+            "valid_samples": len(benchmark_valid_df),
+            "test_samples": len(test_base_df),
+            "last_saved_epoch": last_saved_epoch,
+            "best_val_accuracy": best_acc,
+        }
+        row.update(test_metrics)
+        metrics_rows.append(row)
+
+    metrics_df = pd.DataFrame(metrics_rows)
+    metrics_df.to_csv("benchmarks/metrics.csv", index=False)
+    print("Saved benchmark metrics to benchmarks/metrics.csv")
 
 if __name__ == "__main__":
 
