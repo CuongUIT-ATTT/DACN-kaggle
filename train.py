@@ -1,5 +1,6 @@
 import os
 import sys
+import glob
 
 # Add that directory to sys.path if it's not already there
 if os.getcwd() not in sys.path:
@@ -28,7 +29,7 @@ from devign.devign import Devign
 from sklearn.metrics import confusion_matrix
 from torch_geometric.loader import DataLoader
 from sklearn.model_selection import train_test_split
-from torch.utils.data import Dataset, WeightedRandomSampler
+from torch.utils.data import Dataset, WeightedRandomSampler, Subset
 
 SEED = 42
 
@@ -100,32 +101,133 @@ def select_best_gpu():
 DEVICE = torch.device(f"cuda:{select_best_gpu()}") if torch.cuda.is_available() else "cpu"
 
 class DevignDataset(Dataset):
-    def __init__(self, dataset):
-        self.dataset = dataset
+    def __init__(self, dataset_source, index_file=None, max_load_retries=3):
+        self.max_load_retries = max_load_retries
+        self.mode = "pt_dir" if isinstance(dataset_source, str) else "dataframe"
+
+        if self.mode == "pt_dir":
+            self.data_dir = dataset_source
+            self.index_file = index_file or os.path.join(self.data_dir, "index.csv")
+            self.samples = self._build_sample_index()
+            self.targets = [int(item["target"]) for item in self.samples]
+        else:
+            # Backward-compatible path for existing code that still passes a DataFrame.
+            self.dataset = dataset_source
+            self.targets = [int(t) for t in self.dataset.target.values]
+
         self.set_sampler()
 
     def __len__(self):
+        if self.mode == "pt_dir":
+            return len(self.samples)
         return len(self.dataset)
 
     def __getitem__(self, index):
-        row = self.dataset.iloc[index]
+        if self.mode == "dataframe":
+            row = self.dataset.iloc[index]
+            sample = {
+                "target": torch.tensor(row["target"], dtype=torch.long),
+                "input": row["input"],
+                "id": str(row["id"]),
+            }
+            if hasattr(sample["input"], "y") and sample["input"].y is None:
+                sample["input"].y = torch.tensor([float(row["target"])], dtype=torch.float32)
+            return sample
 
-        # Convert row into a dictionary (or a tensor if needed)
-        sample = {
-            "func": row["func"],
-            "target": torch.tensor(row["target"], dtype=torch.long),
-            "input": row["input"],
-            "id": str(row["id"]),
-            "cpg": row["cpg"]
-        }
+        # Lazy loading mode: only load a single file when requested by DataLoader.
+        last_exc = None
+        n = len(self.samples)
+        for offset in range(min(self.max_load_retries, n)):
+            current_index = (index + offset) % n
+            meta = self.samples[current_index]
+            file_path = meta["file_path"]
 
-        return sample
+            try:
+                # These files are produced by our own preprocessing script, so allow full unpickling.
+                payload = torch.load(file_path, map_location="cpu", weights_only=False)
+
+                if isinstance(payload, dict):
+                    graph = payload.get("input")
+                    target = int(payload.get("target", meta["target"]))
+                    sample_id = str(payload.get("id", meta["id"]))
+                else:
+                    graph = payload
+                    target = int(meta["target"])
+                    sample_id = str(meta["id"])
+
+                if graph is None:
+                    raise ValueError("Missing 'input' graph in sample payload")
+
+                # Ensure label exists on graph for current training loss logic.
+                if not hasattr(graph, "y") or graph.y is None:
+                    graph.y = torch.tensor([float(target)], dtype=torch.float32)
+
+                return {
+                    "input": graph,
+                    "target": torch.tensor(target, dtype=torch.long),
+                    "id": sample_id,
+                }
+            except Exception as exc:
+                last_exc = exc
+                continue
+
+        raise RuntimeError(f"Failed to load sample index {index} after retries: {last_exc}")
+
+    def _build_sample_index(self):
+        if os.path.exists(self.index_file):
+            index_df = pd.read_csv(self.index_file)
+            required_cols = {"filename", "target", "id"}
+            if not required_cols.issubset(index_df.columns):
+                raise ValueError(f"Index file missing columns {required_cols}: {self.index_file}")
+
+            samples = []
+            for row in index_df.itertuples(index=False):
+                filename = str(row.filename)
+                file_path = os.path.join(self.data_dir, filename)
+                if os.path.exists(file_path):
+                    samples.append({
+                        "file_path": file_path,
+                        "target": int(row.target),
+                        "id": str(row.id),
+                    })
+            if samples:
+                return samples
+
+        pt_files = sorted(glob.glob(os.path.join(self.data_dir, "*.pt")))
+        if not pt_files:
+            raise FileNotFoundError(f"No .pt files found in directory: {self.data_dir}")
+
+        samples = []
+        for file_path in pt_files:
+            try:
+                payload = torch.load(file_path, map_location="cpu", weights_only=False)
+                if isinstance(payload, dict):
+                    target = int(payload.get("target", 0))
+                    sample_id = str(payload.get("id", os.path.basename(file_path)))
+                else:
+                    # If target/id are missing, fallback values keep dataset readable.
+                    target = 0
+                    sample_id = os.path.basename(file_path)
+                samples.append({
+                    "file_path": file_path,
+                    "target": target,
+                    "id": sample_id,
+                })
+            except Exception:
+                # Skip malformed files during indexing; __getitem__ also has retry logic.
+                continue
+
+        if not samples:
+            raise RuntimeError(f"Unable to index valid .pt samples in: {self.data_dir}")
+        return samples
 
     def set_sampler(self):
-        class_sample_count = np.array([len(np.where(self.dataset.target == t)[0]) for t in np.unique(self.dataset.target)])
+        unique_targets = np.unique(self.targets)
+        class_sample_count = np.array([len(np.where(np.array(self.targets) == t)[0]) for t in unique_targets])
         weight = 1. / class_sample_count
 
-        samples_weight = np.array([weight[int(t)] for t in self.dataset.target.values])
+        class_to_weight = {int(t): weight[i] for i, t in enumerate(unique_targets)}
+        samples_weight = np.array([class_to_weight[int(t)] for t in self.targets])
         samples_weight = torch.from_numpy(samples_weight).double()
 
         # Check if all indices exist
@@ -549,7 +651,199 @@ def adjust_color(color, factor):
     rgb = np.clip(rgb * factor, 0, 1)
     return mcolors.to_hex(rgb)
 
+
+def split_indices_by_id(index_df: pd.DataFrame, test_size=0.1, val_size=0.1, random_state=SEED):
+    """
+    Split rows by group id so all samples with the same id stay in one split.
+    """
+    if "id" not in index_df.columns:
+        raise ValueError("index.csv must contain an 'id' column")
+
+    id_series = index_df["id"].astype(str)
+    unique_ids = id_series.unique()
+    if len(unique_ids) < 3:
+        raise ValueError("Need at least 3 unique ids for train/val/test split")
+
+    train_val_ids, test_ids = train_test_split(unique_ids, test_size=test_size, random_state=random_state)
+
+    # Keep val ratio relative to the remaining train_val pool.
+    val_ratio_in_train_val = val_size / (1.0 - test_size)
+    train_ids, val_ids = train_test_split(train_val_ids, test_size=val_ratio_in_train_val, random_state=random_state)
+
+    train_indices = index_df[id_series.isin(train_ids)].index.tolist()
+    val_indices = index_df[id_series.isin(val_ids)].index.tolist()
+    test_indices = index_df[id_series.isin(test_ids)].index.tolist()
+
+    return train_indices, val_indices, test_indices
+
+
+def run_lazy_training(processed_dir: str, index_csv: str):
+    """
+    Train Devign directly from split .pt files using lazy loading.
+    """
+    os.makedirs("benchmarks", exist_ok=True)
+
+    index_df = pd.read_csv(index_csv)
+    required_cols = {"filename", "target", "id"}
+    if not required_cols.issubset(index_df.columns):
+        raise ValueError(f"{index_csv} missing required columns: {required_cols}")
+
+    print(f"Loaded index file: {index_csv}")
+    print(f"Total samples: {len(index_df)}")
+
+    train_indices, val_indices, test_indices = split_indices_by_id(
+        index_df,
+        test_size=0.1,
+        val_size=0.1,
+        random_state=SEED,
+    )
+
+    print(f"Split sizes -> train: {len(train_indices)}, valid: {len(val_indices)}, test: {len(test_indices)}")
+
+    full_dataset = DevignDataset(processed_dir, index_file=index_csv)
+    train_dataset = Subset(full_dataset, train_indices)
+    val_dataset = Subset(full_dataset, val_indices)
+    test_dataset = Subset(full_dataset, test_indices)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=PROCESS["batch_size"],
+        shuffle=True,
+        num_workers=4,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=True,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=PROCESS["batch_size"],
+        shuffle=False,
+        num_workers=2,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=True,
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=PROCESS["batch_size"],
+        shuffle=False,
+        num_workers=2,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=True,
+    )
+
+    model = Devign(
+        gated_graph_conv_args={
+            'out_channels': 200,
+            'num_layers': 6,
+            'aggr': 'add',
+            'bias': True
+        },
+        conv_args={
+            'conv1d_1': {
+                'in_channels': 205,
+                'out_channels': 50,
+                'kernel_size': 3,
+                'padding': 1
+            },
+            'conv1d_2': {
+                'in_channels': 50,
+                'out_channels': 20,
+                'kernel_size': 1,
+                'padding': 1
+            },
+            'maxpool1d_1': {
+                'kernel_size': 3,
+                'stride': 2
+            },
+            'maxpool1d_2': {
+                'kernel_size': 2,
+                'stride': 2
+            }
+        },
+        emb_size=101
+    )
+
+    learning_rate = 5e-4
+    weight_decay = 1e-05
+    loss_lambda = 1e-06
+    loss_fc = lambda o, t: F.binary_cross_entropy_with_logits(o, t) + F.l1_loss(o, t) * loss_lambda
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+
+    model.to(DEVICE)
+
+    early_stop_count = 0
+    early_stop = int(PROCESS['epochs'] / 2)
+    best_loss = float('inf')
+    best_acc = 0
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', patience=5, factor=0.5)
+    THRESHOLD = 0.5
+    model_save_path = "benchmarks/devign_Accuracy_lazy.pt"
+
+    for epoch in range(PROCESS['epochs']):
+        train_acc_list = []
+        train_loss_list = []
+
+        model.train()
+        for batch in tqdm(train_loader, desc=f"Train Epoch {epoch+1}"):
+            input_graph = batch["input"].to(DEVICE)
+            logit = model(input_graph)
+            loss = loss_fc(logit, input_graph.y)
+
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            optimizer.step()
+
+            preds = (logit >= THRESHOLD).float().cpu().numpy()
+            acc = binary_accuracy(torch.tensor(preds), input_graph.y.cpu())
+
+            train_acc_list.append(acc)
+            train_loss_list.append(loss.item())
+
+        train_acc = np.mean(train_acc_list)
+        train_loss = np.mean(train_loss_list)
+        val_metrics = eval_model(model, val_loader, threshold=THRESHOLD)
+
+        print(f"Epoch {epoch+1}: train_acc={train_acc:.4f}, train_loss={train_loss:.4f}, val_acc={val_metrics['Accuracy']:.4f}, val_loss={val_metrics['Loss']:.4f}")
+
+        scheduler.step(val_metrics["Accuracy"])
+
+        is_best = (val_metrics["Accuracy"] > best_acc) or (
+            val_metrics["Loss"] < best_loss and val_metrics["Accuracy"] >= best_acc
+        )
+        if is_best:
+            best_acc = val_metrics["Accuracy"]
+            best_loss = val_metrics["Loss"]
+            early_stop_count = 0
+            torch.save(model.state_dict(), model_save_path)
+            print(f"Saved model: {model_save_path}")
+        else:
+            early_stop_count += 1
+
+        if early_stop_count > early_stop:
+            print("Early stopping triggered.")
+            break
+
+    model.load_state_dict(torch.load(model_save_path, map_location=DEVICE))
+    model.eval()
+    test_metrics = eval_model(model, test_loader, test=True)
+    print(
+        f"Test: Acc={test_metrics['Accuracy']:.4f}, Loss={test_metrics['Loss']:.4f}, "
+        f"Precision={test_metrics['Precision']:.4f}, Recall={test_metrics['Recall']:.4f}"
+    )
+
+    metrics_df = pd.DataFrame([test_metrics])
+    metrics_df.to_csv("benchmarks/lazy_metrics.csv", index=False)
+    print("Saved test metrics to benchmarks/lazy_metrics.csv")
+
 if __name__ == "__main__":
+
+    processed_dir = os.getenv("PROCESSED_DATA_DIR", "processed_data")
+    index_csv = os.path.join(processed_dir, "index.csv")
+
+    if os.path.exists(index_csv):
+        print("Lazy-loading mode enabled (using processed_data/*.pt)")
+        run_lazy_training(processed_dir, index_csv)
+        sys.exit(0)
 
     # Load processed datasets
     print("Data Loading")
