@@ -66,6 +66,13 @@ parser.add_argument(
     default=["train"],
 )
 parser.add_argument(
+    "--mode",
+    type=str,
+    default="augmented",
+    choices=["augmented", "original"],
+    help="Processing mode: 'augmented' (flatten orig/adv pairs) or 'original' (single samples).",
+)
+parser.add_argument(
     "--workers",
     type=int,
     default=max(1, (os.cpu_count() or 2) - 1),
@@ -304,6 +311,47 @@ def flatten_dataset(df):
     return flattened_df
 
 
+def prepare_original_dataset(df):
+    """
+    For original mode: process func directly without flattening pairs.
+    Each row remains as-is with func, cpg, target columns.
+    """
+    print("\n[PREPARE] Processing original dataset (single samples)...")
+    original_count = len(df)
+
+    rows = []
+    for idx, row in df.iterrows():
+        cpg_data = extract_cpg_dict(getattr(row, "cpg", None))
+        if cpg_data is None:
+            continue
+
+        target_val = int(getattr(row, "target"))
+        sample_row = {
+            "id": str(idx),
+            "adv": False,
+            "func": getattr(row, "func", None),
+            "cpg": cpg_data,
+            "target": target_val,
+        }
+        if hasattr(row, "cwe"):
+            sample_row["cwe"] = getattr(row, "cwe")
+        rows.append(sample_row)
+
+    prepared_df = pd.DataFrame(rows)
+    if prepared_df.empty:
+        return prepared_df
+
+    prepared_df["target"] = prepared_df["target"].astype(int)
+    prepared_df["id"] = prepared_df["id"].astype(str)
+    prepared_df["adv"] = prepared_df["adv"].astype(bool)
+
+    print(f"  ✓ Original rows: {original_count}")
+    print(f"  ✓ Processed rows: {len(prepared_df)}")
+    print(f"  ✓ Target distribution: {prepared_df['target'].value_counts().to_dict()}")
+
+    return prepared_df
+
+
 def collect_global_corpus_tokens(df: pd.DataFrame) -> List[List[str]]:
     print("\n[TOKENIZATION] Collecting tokens for entire dataset (one-time pass)...")
     corpus_tokens = []
@@ -458,6 +506,8 @@ def enforce_strictly_balanced_pairs(df: pd.DataFrame) -> pd.DataFrame:
     - exactly 2 rows per id
     - one adv=False and one adv=True
     - one target=0 and one target=1
+    
+    Only applies to augmented mode.
     """
     if df.empty:
         print("[STRICT] Dropped 0 rows, keeping 0 rows for 0 complete pairs")
@@ -488,13 +538,31 @@ def enforce_strictly_balanced_pairs(df: pd.DataFrame) -> pd.DataFrame:
     return strict_df
 
 
+def enforce_original_sanity(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    For original mode: just filter out rows missing cpg or func.
+    """
+    if df.empty:
+        print("[SANITY] No rows provided")
+        return df
+
+    working_df = df.copy()
+    valid_mask = (working_df["func"].notna()) & (working_df["cpg"].notna())
+    sanity_df = working_df[valid_mask].reset_index(drop=True)
+
+    dropped_rows = len(working_df) - len(sanity_df)
+    print(f"[SANITY] Dropped {dropped_rows} rows missing func or cpg, keeping {len(sanity_df)} rows")
+    return sanity_df
+
+
 if __name__ == "__main__":
     for dataset in args.dataset:
-        print(f"\nGenerating INPUT for {dataset.upper()} dataset")
+        mode = args.mode
+        print(f"\nGenerating INPUT for {dataset.upper()} dataset ({mode.upper()} mode)")
         print("=" * 80)
 
         dataset_path = f"datasets/cwe20cfa/cwe20cfa_CWE-20_augmented_{dataset}.pkl"
-        output_path = "datasets/cwe20cfa/cwe20cfa_CWE-20_augmented_input_balanced.pkl"
+        output_path = f"datasets/cwe20cfa/cwe20cfa_CWE-20_augmented_input_balanced.pkl"
 
         if os.path.exists(output_path):
             print(f"⚠ Output file already exists and will be overwritten: {output_path}")
@@ -504,10 +572,14 @@ if __name__ == "__main__":
         print(f"\n✓ Loaded {len(dataset_df)} rows from: {dataset_path}")
         print(f"  Columns: {list(dataset_df.columns)}")
 
-        dataset_df = flatten_dataset(dataset_df)
+        # Process dataset based on mode
+        if mode == "augmented":
+            dataset_df = flatten_dataset(dataset_df)
+        else:  # original
+            dataset_df = prepare_original_dataset(dataset_df)
 
         total_examples = len(dataset_df)
-        print(f"\n✓ Total examples to process after flattening: {total_examples}")
+        print(f"\n✓ Total examples to process: {total_examples}")
 
         corpus_tokens = collect_global_corpus_tokens(dataset_df)
         w2vmodel = train_word2vec_once(corpus_tokens)
@@ -519,7 +591,13 @@ if __name__ == "__main__":
             chunk_size=args.chunk_size,
         )
 
-        output_df = enforce_strictly_balanced_pairs(output_df)
+        # Apply post-processing based on mode
+        if mode == "augmented":
+            output_df = enforce_strictly_balanced_pairs(output_df)
+            output_desc = "Gold Standard pairs"
+        else:  # original
+            output_df = enforce_original_sanity(output_df)
+            output_desc = "raw samples"
 
         os.makedirs("tmp/cwe20cfa/w2v", exist_ok=True)
         w2v_path = "tmp/cwe20cfa/w2v/w2vmodel.wv"
@@ -528,11 +606,12 @@ if __name__ == "__main__":
 
         gc.collect()
 
-        print("\n[FINAL] Saved outputs once at end.")
+        print("\n[FINAL] Saved outputs:")
         print(f"  ✓ Word2Vec keyed vectors: {w2v_path}")
         print(f"  ✓ Final dataset: {output_path}")
-        print(f"  ✓ Final rows: {len(output_df)}")
+        print(f"  ✓ Final rows: {len(output_df)} ({output_desc})")
         if not output_df.empty:
             print(f"  ✓ Unique IDs: {output_df['id'].nunique()}")
             print(f"  ✓ Target distribution: {output_df['target'].value_counts().to_dict()}")
-            print(f"  ✓ Adv distribution: {output_df['adv'].value_counts().to_dict()}")
+            if "adv" in output_df.columns:
+                print(f"  ✓ Adv distribution: {output_df['adv'].value_counts().to_dict()}")

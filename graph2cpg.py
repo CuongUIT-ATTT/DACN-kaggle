@@ -46,6 +46,13 @@ parser.add_argument(
     default=AVAILABLE_DATASETS,
 )
 parser.add_argument(
+    "--mode",
+    type=str,
+    default="augmented",
+    choices=["augmented", "original"],
+    help="Processing mode: 'augmented' (orig_func→orig_cpg) or 'original' (func→cpg).",
+)
+parser.add_argument(
     "--batch-size",
     type=int,
     default=DEFAULT_BATCH_SIZE,
@@ -215,10 +222,18 @@ def process_batch(task: Tuple[str, List[Tuple[int, str]], int, int]):
         gc.collect()
 
 
-def build_pending_examples(dataset_df: pd.DataFrame) -> List[Tuple[int, str]]:
+def build_pending_examples(dataset_df: pd.DataFrame, mode: str = "augmented") -> List[Tuple[int, str]]:
     pending = []
-    for index, row in dataset_df[pd.isna(dataset_df["orig_cpg"])].iterrows():
-        pending.append((index, row["orig_func"]))
+    if mode == "augmented":
+        # Mode: orig_func → orig_cpg
+        for index, row in dataset_df[pd.isna(dataset_df["orig_cpg"])].iterrows():
+            if "orig_func" in row.index and pd.notna(row["orig_func"]):
+                pending.append((index, row["orig_func"]))
+    else:  # mode == "original"
+        # Mode: func → cpg
+        for index, row in dataset_df[pd.isna(dataset_df["cpg"])].iterrows():
+            if "func" in row.index and pd.notna(row["func"]):
+                pending.append((index, row["func"]))
     return pending
 
 
@@ -226,21 +241,30 @@ if __name__ == "__main__":
     ensure_directories_exist(PATHS)
 
     for dataset in args.dataset:
-        print(f"\nGenerating CPG for {dataset.upper()} dataset")
-        print("-" * 41)
+        mode = args.mode
+        print(f"\nGenerating CPG for {dataset.upper()} dataset ({mode.upper()} mode)")
+        print("-" * 60)
 
         dataset_path = f"datasets/cwe20cfa/cwe20cfa_CWE-20_augmented_{dataset}.pkl"
-        print(dataset_path)
         filepath = os.path.join(BASE_DIR, dataset_path)
 
         dataset_df = pd.read_pickle(filepath)
-        if "orig_cpg" not in dataset_df.columns:
-            dataset_df["orig_cpg"] = pd.NA
-        dataset_df["orig_cpg"] = dataset_df["orig_cpg"].astype(object)
+        
+        # Initialize CPG columns for chosen mode
+        if mode == "augmented":
+            if "orig_cpg" not in dataset_df.columns:
+                dataset_df["orig_cpg"] = pd.NA
+            dataset_df["orig_cpg"] = dataset_df["orig_cpg"].astype(object)
+            cpg_col_name = "orig_cpg"
+        else:  # original
+            if "cpg" not in dataset_df.columns:
+                dataset_df["cpg"] = pd.NA
+            dataset_df["cpg"] = dataset_df["cpg"].astype(object)
+            cpg_col_name = "cpg"
 
-        pending_examples = build_pending_examples(dataset_df)
+        pending_examples = build_pending_examples(dataset_df, mode=mode)
         if not pending_examples:
-            print("No pending rows. Dataset already has orig_cpg for all samples.")
+            print(f"No pending rows. Dataset already has {cpg_col_name} for all samples.")
             continue
 
         batch_size = max(1, args.batch_size)
@@ -295,7 +319,7 @@ if __name__ == "__main__":
                         failed_indices = result.get("failed_indices", [])
 
                         for idx, cpg in success_map.items():
-                            dataset_df.at[idx, "orig_cpg"] = cpg
+                            dataset_df.at[idx, cpg_col_name] = cpg
 
                         if failed_indices:
                             dataset_df = dataset_df.drop(index=failed_indices, errors="ignore")

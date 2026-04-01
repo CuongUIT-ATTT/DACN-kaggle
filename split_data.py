@@ -2,6 +2,8 @@ import os
 import gc
 import sys
 import argparse
+import importlib
+import types
 from typing import Any, Dict
 
 import numpy as np
@@ -18,6 +20,33 @@ if "numpy._core.numeric" not in sys.modules:
 
 DEFAULT_INPUT_PKL = "datasets/cwe20cfa/cwe20cfa_CWE-20_augmented_input_balanced.pkl"
 FALLBACK_INPUT_PKL = "datasets/cwe20cfa/we20cfa_CWE-20_augmented_input_balanced.pkl"
+
+
+def install_pickle_module_shims() -> None:
+    """
+    Register aliases for legacy module paths embedded in old pickle files.
+    """
+    if "models" not in sys.modules:
+        for candidate in ("devign.src.process.model", "devign.src.process.modeling", "model"):
+            try:
+                sys.modules["models"] = importlib.import_module(candidate)
+                break
+            except Exception:
+                continue
+
+    if "models" not in sys.modules:
+        # Last-resort compatibility layer for legacy pickles that reference
+        # classes under a historical `models` module path.
+        legacy_models = types.ModuleType("models")
+        _class_cache = {}
+
+        def _getattr(name: str):
+            if name not in _class_cache:
+                _class_cache[name] = type(name, (object,), {"__module__": "models"})
+            return _class_cache[name]
+
+        legacy_models.__getattr__ = _getattr
+        sys.modules["models"] = legacy_models
 
 
 def parse_args() -> argparse.Namespace:
@@ -81,6 +110,7 @@ def normalize_target(value: Any) -> int:
 
 def main() -> None:
     args = parse_args()
+    install_pickle_module_shims()
 
     # Graceful fallback for common filename typo variants.
     if not os.path.exists(args.input_pkl) and args.input_pkl == DEFAULT_INPUT_PKL and os.path.exists(FALLBACK_INPUT_PKL):
@@ -90,7 +120,15 @@ def main() -> None:
     index_csv_path = os.path.join(args.output_dir, "index.csv")
 
     print(f"Loading DataFrame from: {args.input_pkl}")
-    df = pd.read_pickle(args.input_pkl)
+    try:
+        df = pd.read_pickle(args.input_pkl)
+    except ModuleNotFoundError as exc:
+        missing_module = exc.name or "unknown"
+        raise RuntimeError(
+            f"Cannot unpickle '{args.input_pkl}' because module '{missing_module}' is missing. "
+            "Install the original project dependencies used to create this pickle, "
+            "or add a compatibility alias in split_data.py (install_pickle_module_shims)."
+        ) from exc
     print(f"Loaded {len(df)} rows")
 
     validate_columns(df, args.input_col, args.target_col, args.id_col)
