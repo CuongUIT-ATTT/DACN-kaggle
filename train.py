@@ -968,10 +968,225 @@ def run_lazy_training(processed_dir: str, index_csv: str):
     metrics_df.to_csv("benchmarks/metrics.csv", index=False)
     print("Saved benchmark metrics to benchmarks/metrics.csv")
 
+
+def run_lazy_training_with_split_dirs(train_dir: str, valid_dir: str, test_dir: str):
+    """
+    Train Devign from pre-split lazy directories (train/valid/test),
+    each containing sample_*.pt and index.csv.
+    """
+    os.makedirs("benchmarks", exist_ok=True)
+
+    train_index_csv = os.path.join(train_dir, "index.csv")
+    valid_index_csv = os.path.join(valid_dir, "index.csv")
+    test_index_csv = os.path.join(test_dir, "index.csv")
+
+    for path in [train_index_csv, valid_index_csv, test_index_csv]:
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Missing required index file: {path}")
+
+    train_base_df = pd.read_csv(train_index_csv)
+    val_base_df = pd.read_csv(valid_index_csv)
+    test_base_df = pd.read_csv(test_index_csv)
+
+    required_cols = {"filename", "target", "id"}
+    for name, df in [("train", train_base_df), ("valid", val_base_df), ("test", test_base_df)]:
+        if not required_cols.issubset(df.columns):
+            raise ValueError(f"{name} index.csv missing required columns: {required_cols}")
+
+    print("Loaded split lazy datasets:")
+    print(f"  Train: {len(train_base_df)} samples from {train_dir}")
+    print(f"  Valid: {len(val_base_df)} samples from {valid_dir}")
+    print(f"  Test : {len(test_base_df)} samples from {test_dir}")
+
+    test_dataset = DevignDataset(test_dir, index_df=test_base_df)
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=PROCESS["batch_size"],
+        shuffle=False,
+        num_workers=2,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=True,
+    )
+
+    benchmark_splits = [(100 - i, i) for i in range(0, 110, 10)]
+    metrics_rows = []
+
+    for orig_pct, adv_pct in benchmark_splits:
+        key = f"{orig_pct}_{adv_pct}"
+        print(f"\nBenchmark {key}")
+        print("-----------------------------------------")
+
+        benchmark_train_df = build_lazy_benchmark_split(train_base_df, orig_frac=orig_pct / 100.0, random_state=SEED)
+        benchmark_valid_df = build_lazy_benchmark_split(val_base_df, orig_frac=orig_pct / 100.0, random_state=SEED + 101)
+
+        train_dataset = DevignDataset(train_dir, index_df=benchmark_train_df)
+        val_dataset = DevignDataset(valid_dir, index_df=benchmark_valid_df)
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=PROCESS["batch_size"],
+            shuffle=True,
+            num_workers=4,
+            pin_memory=torch.cuda.is_available(),
+            persistent_workers=True,
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=PROCESS["batch_size"],
+            shuffle=False,
+            num_workers=2,
+            pin_memory=torch.cuda.is_available(),
+            persistent_workers=True,
+        )
+
+        model = Devign(
+            gated_graph_conv_args={
+                'out_channels': 200,
+                'num_layers': 6,
+                'aggr': 'add',
+                'bias': True
+            },
+            conv_args={
+                'conv1d_1': {'in_channels': 205, 'out_channels': 50, 'kernel_size': 3, 'padding': 1},
+                'conv1d_2': {'in_channels': 50, 'out_channels': 20, 'kernel_size': 1, 'padding': 1},
+                'maxpool1d_1': {'kernel_size': 3, 'stride': 2},
+                'maxpool1d_2': {'kernel_size': 2, 'stride': 2}
+            },
+            emb_size=101
+        )
+
+        learning_rate = 5e-4
+        weight_decay = 1e-05
+        loss_lambda = 1e-06
+        loss_fc = lambda o, t: F.binary_cross_entropy_with_logits(o, t) + F.l1_loss(o, t) * loss_lambda
+        optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+
+        model.to(DEVICE)
+
+        early_stop_count = 0
+        early_stop = int(PROCESS['epochs'] / 2)
+        best_loss = float('inf')
+        best_acc = 0
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', patience=5, factor=0.5)
+        THRESHOLD = 0.5
+        model_save_path = f"benchmarks/devign_Accuracy_{key}.pt"
+
+        train_acc_history = []
+        val_acc_history = []
+        val_target_history = []
+        epochs_history = []
+        last_saved_epoch = None
+
+        for epoch in range(PROCESS['epochs']):
+            train_acc_list = []
+            train_loss_list = []
+
+            model.train()
+            for batch in tqdm(train_loader, desc=f"Train {key} Epoch {epoch+1}"):
+                input_graph = batch["input"].to(DEVICE)
+                logit = model(input_graph)
+                loss = loss_fc(logit, input_graph.y)
+
+                optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                optimizer.step()
+
+                preds = (logit >= THRESHOLD).float().cpu().numpy()
+                acc = binary_accuracy(torch.tensor(preds), input_graph.y.cpu())
+                train_acc_list.append(acc)
+                train_loss_list.append(loss.item())
+
+            train_acc = np.mean(train_acc_list)
+            train_loss = np.mean(train_loss_list)
+            val_metrics = eval_model(model, val_loader, threshold=THRESHOLD)
+
+            train_acc_history.append(train_acc)
+            val_acc_history.append(val_metrics["Accuracy"])
+            val_target_history.append(val_metrics["Accuracy"])
+            epochs_history.append(epoch + 1)
+
+            print(
+                f"Epoch {epoch+1}: train_acc={train_acc:.4f}, train_loss={train_loss:.4f}, "
+                f"val_acc={val_metrics['Accuracy']:.4f}, val_loss={val_metrics['Loss']:.4f}"
+            )
+
+            scheduler.step(val_metrics["Accuracy"])
+
+            is_best = (val_metrics["Accuracy"] > best_acc) or (
+                val_metrics["Loss"] < best_loss and val_metrics["Accuracy"] >= best_acc
+            )
+            if is_best:
+                best_acc = val_metrics["Accuracy"]
+                best_loss = val_metrics["Loss"]
+                early_stop_count = 0
+                last_saved_epoch = epoch + 1
+                torch.save(model.state_dict(), model_save_path)
+                print(f"Saved model: {model_save_path}")
+            else:
+                early_stop_count += 1
+
+            if early_stop_count > early_stop:
+                print("Early stopping triggered.")
+                break
+
+        plt.figure(figsize=(12, 8))
+        plt.plot(epochs_history, train_acc_history, label="Train Accuracy", marker="o")
+        plt.plot(epochs_history, val_acc_history, label="Validation Accuracy", marker="s")
+        plt.plot(epochs_history, val_target_history, label="Validation Accuracy (Target)", marker="d")
+        plt.xlabel("Epochs")
+        plt.ylabel("Performance")
+        plt.title(f"Training vs Validation ({key})")
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(f"benchmarks/training_{key}.png")
+        plt.close()
+
+        model.load_state_dict(torch.load(model_save_path, map_location=DEVICE))
+        model.eval()
+        test_metrics = eval_model(model, test_loader, test=True)
+        print(
+            f"Test {key}: Acc={test_metrics['Accuracy']:.4f}, Loss={test_metrics['Loss']:.4f}, "
+            f"Precision={test_metrics['Precision']:.4f}, Recall={test_metrics['Recall']:.4f}"
+        )
+
+        row = {
+            "benchmark": key,
+            "train_samples": len(benchmark_train_df),
+            "valid_samples": len(benchmark_valid_df),
+            "test_samples": len(test_base_df),
+            "last_saved_epoch": last_saved_epoch,
+            "best_val_accuracy": best_acc,
+        }
+        row.update(test_metrics)
+        metrics_rows.append(row)
+
+    metrics_df = pd.DataFrame(metrics_rows)
+    metrics_df.to_csv("benchmarks/metrics.csv", index=False)
+    print("Saved benchmark metrics to benchmarks/metrics.csv")
+
 if __name__ == "__main__":
 
     processed_dir = os.getenv("PROCESSED_DATA_DIR", "processed_data")
     index_csv = os.path.join(processed_dir, "index.csv")
+    mode = os.getenv("PROCESSED_MODE", "original")
+
+    split_train_dir = os.path.join(processed_dir, f"{mode}_train")
+    split_valid_dir = os.path.join(processed_dir, f"{mode}_valid")
+    split_test_dir = os.path.join(processed_dir, f"{mode}_test")
+
+    split_indexes_exist = all(
+        os.path.exists(os.path.join(path, "index.csv"))
+        for path in [split_train_dir, split_valid_dir, split_test_dir]
+    )
+
+    if split_indexes_exist:
+        print("Lazy-loading mode enabled (using split directories)")
+        print(f"  Train dir: {split_train_dir}")
+        print(f"  Valid dir: {split_valid_dir}")
+        print(f"  Test  dir: {split_test_dir}")
+        run_lazy_training_with_split_dirs(split_train_dir, split_valid_dir, split_test_dir)
+        sys.exit(0)
 
     if os.path.exists(index_csv):
         print("Lazy-loading mode enabled (using processed_data/*.pt)")

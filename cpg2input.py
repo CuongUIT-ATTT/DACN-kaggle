@@ -2,6 +2,9 @@ import os
 import re
 import sys
 import gc
+import signal
+import time
+import threading
 import torch
 import codecs
 import argparse
@@ -84,7 +87,69 @@ parser.add_argument(
     default=32,
     help="chunksize passed to ProcessPoolExecutor.map for lower IPC overhead.",
 )
+parser.add_argument(
+    "--sample-timeout",
+    type=int,
+    default=180,
+    help="Timeout in seconds for processing a single sample. Set <= 0 to disable.",
+)
+parser.add_argument(
+    "--output-root",
+    type=str,
+    default="processed_data",
+    help="Root directory to store streaming .pt outputs and index.csv per split.",
+)
+parser.add_argument(
+    "--overwrite",
+    action="store_true",
+    help="Overwrite existing .pt files in output directory.",
+)
+parser.add_argument(
+    "--max-nodes",
+    type=int,
+    default=500,
+    help="Maximum number of nodes kept per graph.",
+)
+parser.add_argument(
+    "--gc-every",
+    type=int,
+    default=200,
+    help="Run gc.collect() every N processed samples during streaming write.",
+)
 args = parser.parse_args()
+
+
+def _timeout_handler(signum, frame):
+    raise TimeoutError("Sample processing timed out")
+
+
+def run_with_timeout(timeout_seconds: int, stage: str, func, *args, **kwargs):
+    if timeout_seconds is None or timeout_seconds <= 0:
+        return func(*args, **kwargs)
+
+    can_use_signal_alarm = (
+        hasattr(signal, "SIGALRM")
+        and threading.current_thread() is threading.main_thread()
+    )
+
+    if can_use_signal_alarm:
+        previous_handler = signal.getsignal(signal.SIGALRM)
+        signal.signal(signal.SIGALRM, _timeout_handler)
+        signal.alarm(timeout_seconds)
+        try:
+            return func(*args, **kwargs)
+        except TimeoutError:
+            raise TimeoutError(f"{stage} exceeded {timeout_seconds}s")
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, previous_handler)
+
+    start_time = time.monotonic()
+    result = func(*args, **kwargs)
+    elapsed = time.monotonic() - start_time
+    if elapsed > timeout_seconds:
+        raise TimeoutError(f"{stage} exceeded {timeout_seconds}s")
+    return result
 
 
 class NodesEmbedding:
@@ -92,16 +157,17 @@ class NodesEmbedding:
         self.w2v_keyed_vectors = w2v_keyed_vectors
         self.kv_size = w2v_keyed_vectors.vector_size
         self.nodes_dim = nodes_dim
-        self.target = torch.zeros(self.nodes_dim, self.kv_size + 1).float()
 
     def __call__(self, nodes):
         embedded_nodes, code_embedding_mapping = self.embed_nodes(nodes)
+        target = torch.zeros(self.nodes_dim, self.kv_size + 1).float()
 
         if embedded_nodes.size > 0:
             nodes_tensor = torch.from_numpy(embedded_nodes).float()
-            self.target[:nodes_tensor.size(0), :] = nodes_tensor
+            rows_to_copy = min(nodes_tensor.size(0), self.nodes_dim)
+            target[:rows_to_copy, :] = nodes_tensor[:rows_to_copy, :]
 
-        return self.target, code_embedding_mapping
+        return target, code_embedding_mapping
 
     def embed_nodes(self, nodes):
         embeddings = []
@@ -352,25 +418,54 @@ def prepare_original_dataset(df):
     return prepared_df
 
 
-def collect_global_corpus_tokens(df: pd.DataFrame) -> List[List[str]]:
-    print("\n[TOKENIZATION] Collecting tokens for entire dataset (one-time pass)...")
-    corpus_tokens = []
-    for func in df["func"].tolist():
-        tokens = tokenize_code(func)
-        if tokens:
-            corpus_tokens.append(tokens)
-    print(f"  ✓ Collected token sequences: {len(corpus_tokens)}")
-    return corpus_tokens
+class TokenCorpus:
+    def __init__(self, functions, sample_timeout: int, stage: str):
+        self.functions = functions
+        self.sample_timeout = sample_timeout
+        self.stage = stage
+        self.total = 0
+        self.used = 0
+        self.skipped = 0
+
+    def __iter__(self):
+        for idx, func in enumerate(self.functions):
+            self.total += 1
+            try:
+                tokens = run_with_timeout(
+                    self.sample_timeout,
+                    f"{self.stage} tokenization for sample {idx}",
+                    tokenize_code,
+                    func,
+                )
+            except TimeoutError as exc:
+                self.skipped += 1
+                print(f"[WARN] Skipping sample {idx} during {self.stage}: {exc}")
+                continue
+
+            if tokens:
+                self.used += 1
+                yield tokens
 
 
-def train_word2vec_once(corpus_tokens: List[List[str]]) -> Word2Vec:
-    if not corpus_tokens:
+def train_word2vec_once(functions, sample_timeout: int) -> Word2Vec:
+    print("\n[WORD2VEC] Training once on full corpus (streaming tokenizer)...")
+    w2vmodel = Word2Vec(**WORD2VEC_ARGS)
+
+    vocab_corpus = TokenCorpus(functions, sample_timeout, stage="build_vocab")
+    w2vmodel.build_vocab(corpus_iterable=vocab_corpus)
+
+    if w2vmodel.corpus_count == 0:
         raise ValueError("Token corpus is empty. Cannot train Word2Vec.")
 
-    print("\n[WORD2VEC] Training once on full corpus...")
-    w2vmodel = Word2Vec(**WORD2VEC_ARGS)
-    w2vmodel.build_vocab(corpus_iterable=corpus_tokens)
-    w2vmodel.train(corpus_tokens, total_examples=w2vmodel.corpus_count, epochs=5)
+    train_corpus = TokenCorpus(functions, sample_timeout, stage="train")
+    w2vmodel.train(train_corpus, total_examples=w2vmodel.corpus_count, epochs=5)
+
+    print(f"  ✓ Build vocab samples used: {vocab_corpus.used}/{vocab_corpus.total}")
+    if vocab_corpus.skipped:
+        print(f"  ✓ Build vocab skipped slow samples: {vocab_corpus.skipped}")
+    print(f"  ✓ Train samples used: {train_corpus.used}/{train_corpus.total}")
+    if train_corpus.skipped:
+        print(f"  ✓ Train skipped slow samples: {train_corpus.skipped}")
     print("  ✓ Word2Vec training completed.")
     return w2vmodel
 
@@ -439,37 +534,73 @@ def process_full_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if W2V_KV is None:
             raise RuntimeError("W2V worker is not initialized.")
 
-        ordered_nodes, _ = parse_to_nodes(row.get("cpg"), NODES_DIM)
-        if not ordered_nodes:
-            return None
+        sample_timeout = int(row.get("sample_timeout", 0) or 0)
+        max_nodes = int(row.get("max_nodes", NODES_DIM) or NODES_DIM)
 
-        nodes_embedding = NodesEmbedding(NODES_DIM, W2V_KV)
-        graphs_embedding = GraphsEmbedding(EDGE_TYPE)
+        def _process_row():
+            ordered_nodes, _ = parse_to_nodes(row.get("cpg"), max_nodes)
+            if not ordered_nodes:
+                return None
 
-        x, code_embedding_mapping = nodes_embedding(ordered_nodes)
-        edge_index = graphs_embedding(ordered_nodes)
-        label = torch.tensor([int(row["target"])]).float()
-        graph_input = Data(x=x, edge_index=edge_index, y=label)
+            nodes_embedding = NodesEmbedding(max_nodes, W2V_KV)
+            graphs_embedding = GraphsEmbedding(EDGE_TYPE)
 
-        return {
-            "id": str(row["id"]),
-            "adv": bool(row["adv"]),
-            "func": row["func"],
-            "cpg": row["cpg"],
-            "target": int(row["target"]),
-            "cwe": row.get("cwe"),
-            "input": graph_input,
-            "code_embedding_mapping": code_embedding_mapping,
-        }
+            x, _ = nodes_embedding(ordered_nodes)
+            edge_index = graphs_embedding(ordered_nodes)
+            label = torch.tensor([int(row["target"])]).float()
+            graph_input = Data(x=x, edge_index=edge_index, y=label)
+
+            return {
+                "id": str(row["id"]),
+                "adv": bool(row["adv"]),
+                "target": int(row["target"]),
+                "input": graph_input,
+            }
+
+        return run_with_timeout(sample_timeout, f"row id={row.get('id')}", _process_row)
     except Exception as e:
         print(f"[WARN] Failed row id={row.get('id')}: {e}")
         return None
 
 
-def process_dataset_parallel(dataset_df: pd.DataFrame, w2vmodel: Word2Vec, workers: int, chunk_size: int) -> pd.DataFrame:
-    records = dataset_df.to_dict("records")
-    if not records:
-        return pd.DataFrame(columns=["id", "adv", "func", "cpg", "target", "input"])
+def process_dataset_parallel_to_pt(
+    dataset_df: pd.DataFrame,
+    w2vmodel: Word2Vec,
+    workers: int,
+    chunk_size: int,
+    output_dir: str,
+) -> Dict[str, Any]:
+    if dataset_df.empty:
+        os.makedirs(output_dir, exist_ok=True)
+        pd.DataFrame(columns=["sample_index", "filename", "id", "target", "adv"]).to_csv(
+            os.path.join(output_dir, "index.csv"), index=False
+        )
+        return {"written": 0, "skipped": 0, "index_csv": os.path.join(output_dir, "index.csv")}
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    if args.overwrite:
+        for name in os.listdir(output_dir):
+            if name.endswith(".pt") or name == "index.csv":
+                try:
+                    os.remove(os.path.join(output_dir, name))
+                except OSError:
+                    pass
+
+    def worker_input_iter():
+        for row in dataset_df.itertuples(index=False):
+            yield {
+                "id": str(getattr(row, "id")),
+                "adv": bool(getattr(row, "adv")),
+                "target": int(getattr(row, "target")),
+                "cpg": getattr(row, "cpg", None),
+                "sample_timeout": args.sample_timeout,
+                "max_nodes": args.max_nodes,
+            }
+
+    written = 0
+    skipped = 0
+    index_records = []
 
     with ProcessPoolExecutor(
         max_workers=workers,
@@ -482,22 +613,45 @@ def process_dataset_parallel(dataset_df: pd.DataFrame, w2vmodel: Word2Vec, worke
             TextColumn("[bold cyan]{task.percentage:>3.1f}%"),
             TimeRemainingColumn(),
         ) as progress:
-            task = progress.add_task("[magenta]Worker map", total=len(records))
+            task = progress.add_task("[magenta]Worker map", total=len(dataset_df))
 
-            results = []
-            for item in executor.map(process_full_row, records, chunksize=chunk_size):
-                results.append(item)
+            for item in executor.map(process_full_row, worker_input_iter(), chunksize=chunk_size):
                 progress.update(task, advance=1)
 
-    results_list = [item for item in results if item is not None]
+                if item is None:
+                    skipped += 1
+                    continue
 
-    if not results_list:
-        return pd.DataFrame(columns=["id", "adv", "func", "cpg", "target", "input"])
+                filename = f"sample_{written}.pt"
+                out_path = os.path.join(output_dir, filename)
+                torch.save(
+                    {
+                        "input": item["input"],
+                        "target": int(item["target"]),
+                        "id": str(item["id"]),
+                        "adv": bool(item["adv"]),
+                    },
+                    out_path,
+                    pickle_protocol=4,
+                )
 
-    output_df = pd.DataFrame(results_list)
-    columns = ["id", "adv", "func", "cpg", "target", "input", "cwe", "code_embedding_mapping"]
-    output_df = output_df[[col for col in columns if col in output_df.columns]]
-    return output_df
+                index_records.append(
+                    {
+                        "sample_index": written,
+                        "filename": filename,
+                        "id": str(item["id"]),
+                        "target": int(item["target"]),
+                        "adv": bool(item["adv"]),
+                    }
+                )
+                written += 1
+
+                if (written + skipped) % max(1, args.gc_every) == 0:
+                    gc.collect()
+
+    index_csv = os.path.join(output_dir, "index.csv")
+    pd.DataFrame(index_records).to_csv(index_csv, index=False)
+    return {"written": written, "skipped": skipped, "index_csv": index_csv}
 
 
 def enforce_strictly_balanced_pairs(df: pd.DataFrame) -> pd.DataFrame:
@@ -561,13 +715,31 @@ if __name__ == "__main__":
         print(f"\nGenerating INPUT for {dataset.upper()} dataset ({mode.upper()} mode)")
         print("=" * 80)
 
-        dataset_path = f"datasets/cwe20cfa/cwe20cfa_CWE-20_augmented_{dataset}.pkl"
-        output_path = f"datasets/cwe20cfa/cwe20cfa_CWE-20_augmented_input_balanced.pkl"
+        # Select dataset path based on mode with fallback logic
+        if mode == "original":
+            dataset_path = f"datasets/cwe20cfa/cwe20cfa_CWE-20_original_{dataset}.pkl"
+            fallback_path = f"datasets/cwe20cfa/cwe20cfa_CWE-20_augmented_{dataset}.pkl"
+            output_path = f"datasets/cwe20cfa/cwe20cfa_CWE-20_original_input_{dataset}.pkl"
+        else:  # augmented
+            dataset_path = f"datasets/cwe20cfa/cwe20cfa_CWE-20_augmented_{dataset}.pkl"
+            fallback_path = f"datasets/cwe20cfa/cwe20cfa_CWE-20_original_{dataset}.pkl"
+            output_path = f"datasets/cwe20cfa/cwe20cfa_CWE-20_augmented_input_balanced.pkl"
 
-        if os.path.exists(output_path):
-            print(f"⚠ Output file already exists and will be overwritten: {output_path}")
+        # Check file existence with fallback
+        filepath = os.path.join(os.getcwd(), dataset_path)
+        if not os.path.exists(filepath):
+            fallback_fullpath = os.path.join(os.getcwd(), fallback_path)
+            if os.path.exists(fallback_fullpath):
+                print(f"[WARN] Expected file not found: {filepath}")
+                print(f"[WARN] Using fallback file: {fallback_fullpath}")
+                filepath = fallback_fullpath
+            else:
+                raise FileNotFoundError(
+                    f"Input dataset not found for mode={mode}, split={dataset}. "
+                    f"Tried: {filepath} and {fallback_fullpath}"
+                )
 
-        dataset_df = pd.read_pickle(dataset_path)
+        dataset_df = pd.read_pickle(filepath)
 
         print(f"\n✓ Loaded {len(dataset_df)} rows from: {dataset_path}")
         print(f"  Columns: {list(dataset_df.columns)}")
@@ -578,40 +750,38 @@ if __name__ == "__main__":
         else:  # original
             dataset_df = prepare_original_dataset(dataset_df)
 
+        # Apply post-processing based on mode before embedding
+        if mode == "augmented":
+            dataset_df = enforce_strictly_balanced_pairs(dataset_df)
+            output_desc = "Gold Standard pairs"
+        else:  # original
+            dataset_df = enforce_original_sanity(dataset_df)
+            output_desc = "raw samples"
+
         total_examples = len(dataset_df)
         print(f"\n✓ Total examples to process: {total_examples}")
 
-        corpus_tokens = collect_global_corpus_tokens(dataset_df)
-        w2vmodel = train_word2vec_once(corpus_tokens)
+        w2vmodel = train_word2vec_once(dataset_df["func"], args.sample_timeout)
 
-        output_df = process_dataset_parallel(
+        output_dir = os.path.join(args.output_root, f"{mode}_{dataset}")
+        stream_stats = process_dataset_parallel_to_pt(
             dataset_df=dataset_df,
             w2vmodel=w2vmodel,
             workers=args.workers,
             chunk_size=args.chunk_size,
+            output_dir=output_dir,
         )
 
-        # Apply post-processing based on mode
-        if mode == "augmented":
-            output_df = enforce_strictly_balanced_pairs(output_df)
-            output_desc = "Gold Standard pairs"
-        else:  # original
-            output_df = enforce_original_sanity(output_df)
-            output_desc = "raw samples"
-
         os.makedirs("tmp/cwe20cfa/w2v", exist_ok=True)
-        w2v_path = "tmp/cwe20cfa/w2v/w2vmodel.wv"
+        w2v_path = f"tmp/cwe20cfa/w2v/w2vmodel_{mode}_{dataset}.wv"
         w2vmodel.wv.save(w2v_path)
-        output_df.to_pickle(output_path)
 
         gc.collect()
 
         print("\n[FINAL] Saved outputs:")
         print(f"  ✓ Word2Vec keyed vectors: {w2v_path}")
-        print(f"  ✓ Final dataset: {output_path}")
-        print(f"  ✓ Final rows: {len(output_df)} ({output_desc})")
-        if not output_df.empty:
-            print(f"  ✓ Unique IDs: {output_df['id'].nunique()}")
-            print(f"  ✓ Target distribution: {output_df['target'].value_counts().to_dict()}")
-            if "adv" in output_df.columns:
-                print(f"  ✓ Adv distribution: {output_df['adv'].value_counts().to_dict()}")
+        print(f"  ✓ Output directory: {output_dir}")
+        print(f"  ✓ Index CSV: {stream_stats['index_csv']}")
+        print(f"  ✓ Final rows: {stream_stats['written']} ({output_desc})")
+        if stream_stats["skipped"]:
+            print(f"  ✓ Skipped rows during graph build: {stream_stats['skipped']}")

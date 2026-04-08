@@ -245,8 +245,26 @@ if __name__ == "__main__":
         print(f"\nGenerating CPG for {dataset.upper()} dataset ({mode.upper()} mode)")
         print("-" * 60)
 
-        dataset_path = f"datasets/cwe20cfa/cwe20cfa_CWE-20_augmented_{dataset}.pkl"
+        if mode == "original":
+            dataset_path = f"datasets/cwe20cfa/cwe20cfa_CWE-20_original_{dataset}.pkl"
+            fallback_path = f"datasets/cwe20cfa/cwe20cfa_CWE-20_augmented_{dataset}.pkl"
+        else:
+            dataset_path = f"datasets/cwe20cfa/cwe20cfa_CWE-20_augmented_{dataset}.pkl"
+            fallback_path = f"datasets/cwe20cfa/cwe20cfa_CWE-20_original_{dataset}.pkl"
+
         filepath = os.path.join(BASE_DIR, dataset_path)
+
+        if not os.path.exists(filepath):
+            fallback_fullpath = os.path.join(BASE_DIR, fallback_path)
+            if os.path.exists(fallback_fullpath):
+                print(f"[WARN] Expected file not found: {filepath}")
+                print(f"[WARN] Using fallback file: {fallback_fullpath}")
+                filepath = fallback_fullpath
+            else:
+                raise FileNotFoundError(
+                    f"Input dataset not found for mode={mode}, split={dataset}. "
+                    f"Tried: {filepath} and {fallback_fullpath}"
+                )
 
         dataset_df = pd.read_pickle(filepath)
         
