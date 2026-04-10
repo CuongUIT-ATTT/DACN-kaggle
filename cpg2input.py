@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import json
 import gc
 import signal
 import time
@@ -103,6 +104,11 @@ parser.add_argument(
     "--overwrite",
     action="store_true",
     help="Overwrite existing .pt files in output directory.",
+)
+parser.add_argument(
+    "--resume",
+    action="store_true",
+    help="Resume from existing index.csv and sample_*.pt in output directory.",
 )
 parser.add_argument(
     "--max-nodes",
@@ -316,6 +322,13 @@ def extract_cpg_dict(cpg_data):
     if isinstance(cpg_data, list):
         return cpg_data[0] if cpg_data else None
     return cpg_data
+
+
+def normalize_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    return text in {"1", "true", "t", "yes", "y"}
 
 
 def flip_target(target):
@@ -565,7 +578,7 @@ def process_full_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 def process_dataset_parallel_to_pt(
     dataset_df: pd.DataFrame,
-    w2vmodel: Word2Vec,
+    w2v_keyed_vectors: Word2VecKeyedVectors,
     workers: int,
     chunk_size: int,
     output_dir: str,
@@ -579,6 +592,9 @@ def process_dataset_parallel_to_pt(
 
     os.makedirs(output_dir, exist_ok=True)
 
+    if args.overwrite and args.resume:
+        raise ValueError("--overwrite and --resume cannot be used together.")
+
     if args.overwrite:
         for name in os.listdir(output_dir):
             if name.endswith(".pt") or name == "index.csv":
@@ -587,8 +603,77 @@ def process_dataset_parallel_to_pt(
                 except OSError:
                     pass
 
+    index_csv = os.path.join(output_dir, "index.csv")
+    existing_records: List[Dict[str, Any]] = []
+    completed_keys = set()
+    next_sample_index = 0
+
+    if args.resume and os.path.exists(index_csv):
+        try:
+            existing_index_df = pd.read_csv(index_csv)
+            required_cols = {"sample_index", "filename", "id", "target", "adv"}
+            if required_cols.issubset(existing_index_df.columns):
+                # Keep only entries whose .pt files still exist.
+                for row in existing_index_df.itertuples(index=False):
+                    filename = str(getattr(row, "filename"))
+                    pt_path = os.path.join(output_dir, filename)
+                    if not os.path.exists(pt_path):
+                        continue
+
+                    sample_index = int(getattr(row, "sample_index"))
+                    sample_id = str(getattr(row, "id"))
+                    target = int(getattr(row, "target"))
+                    adv = normalize_bool(getattr(row, "adv"))
+
+                    existing_records.append(
+                        {
+                            "sample_index": sample_index,
+                            "filename": filename,
+                            "id": sample_id,
+                            "target": target,
+                            "adv": adv,
+                        }
+                    )
+                    completed_keys.add((sample_id, adv, target))
+
+                if existing_records:
+                    next_sample_index = max(r["sample_index"] for r in existing_records) + 1
+                print(
+                    f"[RESUME] Found {len(existing_records)} existing valid samples in {output_dir}; "
+                    f"starting new files from sample_{next_sample_index}.pt"
+                )
+            else:
+                print(f"[WARN] Existing index.csv missing required columns: {required_cols}. Ignoring resume state.")
+        except Exception as exc:
+            print(f"[WARN] Failed to read existing index.csv for resume: {exc}. Starting fresh write.")
+
+    working_df = dataset_df
+    if completed_keys:
+        row_keys = list(
+            zip(
+                dataset_df["id"].astype(str),
+                dataset_df["adv"].astype(bool),
+                dataset_df["target"].astype(int),
+            )
+        )
+        keep_mask = [key not in completed_keys for key in row_keys]
+        working_df = dataset_df[keep_mask].reset_index(drop=True)
+        print(f"[RESUME] Pending rows to process: {len(working_df)} / {len(dataset_df)}")
+
+    if working_df.empty:
+        pd.DataFrame(existing_records, columns=["sample_index", "filename", "id", "target", "adv"]).to_csv(
+            index_csv, index=False
+        )
+        return {
+            "written": len(existing_records),
+            "written_new": 0,
+            "resumed_existing": len(existing_records),
+            "skipped": 0,
+            "index_csv": index_csv,
+        }
+
     def worker_input_iter():
-        for row in dataset_df.itertuples(index=False):
+        for row in working_df.itertuples(index=False):
             yield {
                 "id": str(getattr(row, "id")),
                 "adv": bool(getattr(row, "adv")),
@@ -598,14 +683,15 @@ def process_dataset_parallel_to_pt(
                 "max_nodes": args.max_nodes,
             }
 
-    written = 0
+    written_existing = len(existing_records)
+    written_new = 0
     skipped = 0
-    index_records = []
+    index_records = list(existing_records)
 
     with ProcessPoolExecutor(
         max_workers=workers,
         initializer=_init_worker,
-        initargs=(w2vmodel.wv,),
+        initargs=(w2v_keyed_vectors,),
     ) as executor:
         with Progress(
             TextColumn("[bold magenta]Processing rows..."),
@@ -613,7 +699,7 @@ def process_dataset_parallel_to_pt(
             TextColumn("[bold cyan]{task.percentage:>3.1f}%"),
             TimeRemainingColumn(),
         ) as progress:
-            task = progress.add_task("[magenta]Worker map", total=len(dataset_df))
+            task = progress.add_task("[magenta]Worker map", total=len(working_df))
 
             for item in executor.map(process_full_row, worker_input_iter(), chunksize=chunk_size):
                 progress.update(task, advance=1)
@@ -622,7 +708,7 @@ def process_dataset_parallel_to_pt(
                     skipped += 1
                     continue
 
-                filename = f"sample_{written}.pt"
+                filename = f"sample_{next_sample_index}.pt"
                 out_path = os.path.join(output_dir, filename)
                 torch.save(
                     {
@@ -637,21 +723,27 @@ def process_dataset_parallel_to_pt(
 
                 index_records.append(
                     {
-                        "sample_index": written,
+                        "sample_index": next_sample_index,
                         "filename": filename,
                         "id": str(item["id"]),
                         "target": int(item["target"]),
                         "adv": bool(item["adv"]),
                     }
                 )
-                written += 1
+                written_new += 1
+                next_sample_index += 1
 
-                if (written + skipped) % max(1, args.gc_every) == 0:
+                if (written_new + skipped) % max(1, args.gc_every) == 0:
                     gc.collect()
 
-    index_csv = os.path.join(output_dir, "index.csv")
     pd.DataFrame(index_records).to_csv(index_csv, index=False)
-    return {"written": written, "skipped": skipped, "index_csv": index_csv}
+    return {
+        "written": written_existing + written_new,
+        "written_new": written_new,
+        "resumed_existing": written_existing,
+        "skipped": skipped,
+        "index_csv": index_csv,
+    }
 
 
 def enforce_strictly_balanced_pairs(df: pd.DataFrame) -> pd.DataFrame:
@@ -761,20 +853,25 @@ if __name__ == "__main__":
         total_examples = len(dataset_df)
         print(f"\n✓ Total examples to process: {total_examples}")
 
-        w2vmodel = train_word2vec_once(dataset_df["func"], args.sample_timeout)
+        os.makedirs("tmp/cwe20cfa/w2v", exist_ok=True)
+        w2v_path = f"tmp/cwe20cfa/w2v/w2vmodel_{mode}_{dataset}.wv"
+
+        if args.resume and os.path.exists(w2v_path):
+            print(f"\n[WORD2VEC] Resume mode: loading existing keyed vectors from {w2v_path}")
+            w2v_keyed_vectors = Word2VecKeyedVectors.load(w2v_path)
+        else:
+            w2vmodel = train_word2vec_once(dataset_df["func"], args.sample_timeout)
+            w2vmodel.wv.save(w2v_path)
+            w2v_keyed_vectors = w2vmodel.wv
 
         output_dir = os.path.join(args.output_root, f"{mode}_{dataset}")
         stream_stats = process_dataset_parallel_to_pt(
             dataset_df=dataset_df,
-            w2vmodel=w2vmodel,
+            w2v_keyed_vectors=w2v_keyed_vectors,
             workers=args.workers,
             chunk_size=args.chunk_size,
             output_dir=output_dir,
         )
-
-        os.makedirs("tmp/cwe20cfa/w2v", exist_ok=True)
-        w2v_path = f"tmp/cwe20cfa/w2v/w2vmodel_{mode}_{dataset}.wv"
-        w2vmodel.wv.save(w2v_path)
 
         gc.collect()
 
@@ -783,5 +880,9 @@ if __name__ == "__main__":
         print(f"  ✓ Output directory: {output_dir}")
         print(f"  ✓ Index CSV: {stream_stats['index_csv']}")
         print(f"  ✓ Final rows: {stream_stats['written']} ({output_desc})")
+        if stream_stats.get("resumed_existing", 0):
+            print(f"  ✓ Resumed existing rows: {stream_stats['resumed_existing']}")
+        if stream_stats.get("written_new", 0):
+            print(f"  ✓ Newly written rows this run: {stream_stats['written_new']}")
         if stream_stats["skipped"]:
             print(f"  ✓ Skipped rows during graph build: {stream_stats['skipped']}")
