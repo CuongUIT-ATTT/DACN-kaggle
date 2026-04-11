@@ -1,6 +1,7 @@
 import os
 import sys
 import glob
+import argparse
 
 # Add that directory to sys.path if it's not already there
 if os.getcwd() not in sys.path:
@@ -1165,11 +1166,63 @@ def run_lazy_training_with_split_dirs(train_dir: str, valid_dir: str, test_dir: 
     metrics_df.to_csv("benchmarks/metrics.csv", index=False)
     print("Saved benchmark metrics to benchmarks/metrics.csv")
 
+def parse_args():
+    env_processed_dir = os.getenv("PROCESSED_DATA_DIR", "processed_data")
+    env_mode = os.getenv("PROCESSED_MODE", "original")
+
+    parser = argparse.ArgumentParser(
+        description="Train Devign model from lazy-loading processed data directories."
+    )
+    parser.add_argument(
+        "--processed-data-dir",
+        default=env_processed_dir,
+        help="Root directory that contains processed split folders or index.csv.",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["original", "augmented"],
+        default=env_mode,
+        help="Data mode used to resolve split folders: <mode>_train/valid/test.",
+    )
+    parser.add_argument(
+        "--index-csv",
+        default=None,
+        help="Optional explicit index.csv path for flat lazy-loading mode.",
+    )
+    parser.add_argument(
+        "--force-flat-index",
+        action="store_true",
+        help="Force using flat lazy-loading mode with processed_data/index.csv.",
+    )
+
+    # Backward-compatible UX for users who type `python train.py -original`.
+    parser.add_argument("-original", "--original", action="store_true", help="Shortcut to set --mode original.")
+    parser.add_argument("-augmented", "--augmented", action="store_true", help="Shortcut to set --mode augmented.")
+
+    args = parser.parse_args()
+
+    if args.original and args.augmented:
+        parser.error("Use only one of -original/--original or -augmented/--augmented.")
+
+    if args.original:
+        args.mode = "original"
+    elif args.augmented:
+        args.mode = "augmented"
+
+    return args
+
+
 if __name__ == "__main__":
 
-    processed_dir = os.getenv("PROCESSED_DATA_DIR", "processed_data")
-    index_csv = os.path.join(processed_dir, "index.csv")
-    mode = os.getenv("PROCESSED_MODE", "original")
+    cli_args = parse_args()
+    processed_dir = cli_args.processed_data_dir
+    mode = cli_args.mode
+    index_csv = cli_args.index_csv or os.path.join(processed_dir, "index.csv")
+
+    print("Training configuration:")
+    print(f"  processed_data_dir: {processed_dir}")
+    print(f"  mode: {mode}")
+    print(f"  index_csv: {index_csv}")
 
     split_train_dir = os.path.join(processed_dir, f"{mode}_train")
     split_valid_dir = os.path.join(processed_dir, f"{mode}_valid")
@@ -1180,7 +1233,7 @@ if __name__ == "__main__":
         for path in [split_train_dir, split_valid_dir, split_test_dir]
     )
 
-    if split_indexes_exist:
+    if split_indexes_exist and not cli_args.force_flat_index:
         print("Lazy-loading mode enabled (using split directories)")
         print(f"  Train dir: {split_train_dir}")
         print(f"  Valid dir: {split_valid_dir}")
