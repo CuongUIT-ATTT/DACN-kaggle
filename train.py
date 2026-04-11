@@ -101,6 +101,46 @@ def select_best_gpu():
 
 DEVICE = torch.device(f"cuda:{select_best_gpu()}") if torch.cuda.is_available() else "cpu"
 
+
+def infer_graph_dims_from_index_and_dir(index_df: pd.DataFrame, data_dir: str):
+    """Infer (nodes_dim, emb_size) from the first readable sample in index_df."""
+    for row in index_df.itertuples(index=False):
+        filename = str(getattr(row, "filename"))
+        file_path = os.path.join(data_dir, filename)
+        if not os.path.exists(file_path):
+            continue
+
+        payload = torch.load(file_path, map_location="cpu", weights_only=False)
+        graph = payload.get("input") if isinstance(payload, dict) else payload
+        if graph is None or not hasattr(graph, "x") or graph.x is None:
+            continue
+
+        nodes_dim = int(graph.x.shape[0])
+        emb_size = int(graph.x.shape[1])
+        if nodes_dim <= 0 or emb_size <= 0:
+            continue
+        return nodes_dim, emb_size
+
+    raise RuntimeError(f"Could not infer graph dimensions from samples in: {data_dir}")
+
+
+def build_devign_model(nodes_dim: int, emb_size: int) -> Devign:
+    return Devign(
+        gated_graph_conv_args={
+            'out_channels': 200,
+            'num_layers': 6,
+            'aggr': 'add',
+            'bias': True
+        },
+        conv_args={
+            'conv1d_1': {'in_channels': nodes_dim, 'out_channels': 50, 'kernel_size': 3, 'padding': 1},
+            'conv1d_2': {'in_channels': 50, 'out_channels': 20, 'kernel_size': 1, 'padding': 1},
+            'maxpool1d_1': {'kernel_size': 3, 'stride': 2},
+            'maxpool1d_2': {'kernel_size': 2, 'stride': 2}
+        },
+        emb_size=emb_size
+    )
+
 class DevignDataset(Dataset):
     def __init__(self, dataset_source, index_file=None, index_df=None, max_load_retries=3):
         self.max_load_retries = max_load_retries
@@ -802,6 +842,9 @@ def run_lazy_training(processed_dir: str, index_csv: str):
     val_base_df = index_df.loc[val_indices].reset_index(drop=True)
     test_base_df = index_df.loc[test_indices].reset_index(drop=True)
 
+    nodes_dim, emb_size = infer_graph_dims_from_index_and_dir(train_base_df, processed_dir)
+    print(f"Inferred graph dims from samples -> nodes_dim={nodes_dim}, emb_size={emb_size}")
+
     test_dataset = DevignDataset(processed_dir, index_df=test_base_df)
     test_loader = DataLoader(
         test_dataset,
@@ -843,21 +886,7 @@ def run_lazy_training(processed_dir: str, index_csv: str):
             persistent_workers=True,
         )
 
-        model = Devign(
-            gated_graph_conv_args={
-                'out_channels': 200,
-                'num_layers': 6,
-                'aggr': 'add',
-                'bias': True
-            },
-            conv_args={
-                'conv1d_1': {'in_channels': 205, 'out_channels': 50, 'kernel_size': 3, 'padding': 1},
-                'conv1d_2': {'in_channels': 50, 'out_channels': 20, 'kernel_size': 1, 'padding': 1},
-                'maxpool1d_1': {'kernel_size': 3, 'stride': 2},
-                'maxpool1d_2': {'kernel_size': 2, 'stride': 2}
-            },
-            emb_size=101
-        )
+        model = build_devign_model(nodes_dim=nodes_dim, emb_size=emb_size)
 
         learning_rate = 5e-4
         weight_decay = 1e-05
@@ -999,6 +1028,9 @@ def run_lazy_training_with_split_dirs(train_dir: str, valid_dir: str, test_dir: 
     print(f"  Valid: {len(val_base_df)} samples from {valid_dir}")
     print(f"  Test : {len(test_base_df)} samples from {test_dir}")
 
+    nodes_dim, emb_size = infer_graph_dims_from_index_and_dir(train_base_df, train_dir)
+    print(f"Inferred graph dims from samples -> nodes_dim={nodes_dim}, emb_size={emb_size}")
+
     test_dataset = DevignDataset(test_dir, index_df=test_base_df)
     test_loader = DataLoader(
         test_dataset,
@@ -1040,21 +1072,7 @@ def run_lazy_training_with_split_dirs(train_dir: str, valid_dir: str, test_dir: 
             persistent_workers=True,
         )
 
-        model = Devign(
-            gated_graph_conv_args={
-                'out_channels': 200,
-                'num_layers': 6,
-                'aggr': 'add',
-                'bias': True
-            },
-            conv_args={
-                'conv1d_1': {'in_channels': 205, 'out_channels': 50, 'kernel_size': 3, 'padding': 1},
-                'conv1d_2': {'in_channels': 50, 'out_channels': 20, 'kernel_size': 1, 'padding': 1},
-                'maxpool1d_1': {'kernel_size': 3, 'stride': 2},
-                'maxpool1d_2': {'kernel_size': 2, 'stride': 2}
-            },
-            emb_size=101
-        )
+        model = build_devign_model(nodes_dim=nodes_dim, emb_size=emb_size)
 
         learning_rate = 5e-4
         weight_decay = 1e-05
