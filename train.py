@@ -379,11 +379,15 @@ def compute_pairwise_metrics_from_loader(model, dataloader):
     total = 0
     stats = {"P-C": 0, "P-V": 0, "P-B": 0, "P-R": 0}
     for pid, samples in pair_groups.items():
-        if len(samples[0]) != 2:
-            continue  # skip unpaired or malformed groups
+        if len(samples) != 2:
+            continue  # skip unpaired groups
 
         # Extract predictions and labels
         (p1, y1), (p2, y2) = samples
+
+        # Require one vulnerable and one benign sample per pair.
+        if {int(y1), int(y2)} != {0, 1}:
+            continue
 
         # Sort so y1 == 1 means vulnerable
         if y1 == 0 and y2 == 1:
