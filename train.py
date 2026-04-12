@@ -275,8 +275,20 @@ class DevignDataset(Dataset):
         return samples
 
     def set_sampler(self):
+        if len(self.targets) == 0:
+            self.sampler = None
+            return
+
         unique_targets = np.unique(self.targets)
+        if len(unique_targets) == 0:
+            self.sampler = None
+            return
+
         class_sample_count = np.array([len(np.where(np.array(self.targets) == t)[0]) for t in unique_targets])
+        if np.any(class_sample_count <= 0):
+            self.sampler = None
+            return
+
         weight = 1. / class_sample_count
 
         class_to_weight = {int(t): weight[i] for i, t in enumerate(unique_targets)}
@@ -289,7 +301,7 @@ class DevignDataset(Dataset):
         self.sampler = sampler
 
     def get_loader(self, batch_size, shuffle=True, use_sampler=True):
-        if use_sampler:
+        if use_sampler and self.sampler is not None:
             return DataLoader(dataset=self, batch_size=batch_size, shuffle=False, sampler=self.sampler)
         else:
             # When not using the sampler, use normal shuffling.
@@ -814,6 +826,13 @@ def build_lazy_benchmark_split(split_df: pd.DataFrame, orig_frac: float, random_
     selected_orig = sample_balanced_from_pool(orig_df, n_orig, random_state=random_state)
     selected_ce = sample_balanced_from_pool(ce_df, n_ce, random_state=random_state + 17)
 
+    # Fallback: if one requested pool is empty (e.g., split has only adv=True ids),
+    # backfill from the whole split to keep the benchmark non-empty and runnable.
+    if n_orig > 0 and len(selected_orig) == 0:
+        selected_orig = sample_balanced_from_pool(split_df, n_orig, random_state=random_state + 101)
+    if n_ce > 0 and len(selected_ce) == 0:
+        selected_ce = sample_balanced_from_pool(split_df, n_ce, random_state=random_state + 117)
+
     result = pd.concat([selected_orig, selected_ce], ignore_index=False)
     result = result.sample(frac=1, random_state=random_state + 33).reset_index(drop=True)
     return result
@@ -869,6 +888,13 @@ def run_lazy_training(processed_dir: str, index_csv: str):
 
         benchmark_train_df = build_lazy_benchmark_split(train_base_df, orig_frac=orig_pct / 100.0, random_state=SEED)
         benchmark_valid_df = build_lazy_benchmark_split(val_base_df, orig_frac=orig_pct / 100.0, random_state=SEED + 101)
+
+        if benchmark_train_df.empty or benchmark_valid_df.empty:
+            print(
+                f"[WARN] Skipping benchmark {key}: empty split "
+                f"(train={len(benchmark_train_df)}, valid={len(benchmark_valid_df)})"
+            )
+            continue
 
         train_dataset = DevignDataset(processed_dir, index_df=benchmark_train_df)
         val_dataset = DevignDataset(processed_dir, index_df=benchmark_valid_df)
@@ -1055,6 +1081,13 @@ def run_lazy_training_with_split_dirs(train_dir: str, valid_dir: str, test_dir: 
 
         benchmark_train_df = build_lazy_benchmark_split(train_base_df, orig_frac=orig_pct / 100.0, random_state=SEED)
         benchmark_valid_df = build_lazy_benchmark_split(val_base_df, orig_frac=orig_pct / 100.0, random_state=SEED + 101)
+
+        if benchmark_train_df.empty or benchmark_valid_df.empty:
+            print(
+                f"[WARN] Skipping benchmark {key}: empty split "
+                f"(train={len(benchmark_train_df)}, valid={len(benchmark_valid_df)})"
+            )
+            continue
 
         train_dataset = DevignDataset(train_dir, index_df=benchmark_train_df)
         val_dataset = DevignDataset(valid_dir, index_df=benchmark_valid_df)
