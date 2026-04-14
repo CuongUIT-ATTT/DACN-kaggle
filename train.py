@@ -647,7 +647,7 @@ def create_balanced_symmetric_benchmark_split(df, orig_frac, size=10000, random_
 
     return full_df
 
-def plot_benchmark_distribution_with_duplicates_stacked(benchmark_datasets):
+def plot_benchmark_distribution_with_duplicates_stacked(benchmark_datasets, output_paths=None):
     import matplotlib.pyplot as plt
     import matplotlib.patches as mpatches
     import numpy as np
@@ -716,8 +716,12 @@ def plot_benchmark_distribution_with_duplicates_stacked(benchmark_datasets):
     ax.set_ylim(top=6500) 
     plt.subplots_adjust(bottom=0.3)
     plt.tight_layout()
-    plt.savefig(f'benchmarks/dataset_distribution.png')
-    plt.show()
+    if output_paths:
+        for path in output_paths:
+            plt.savefig(path)
+    else:
+        plt.savefig('benchmarks/dataset_distribution.png')
+    plt.close()
 
 def summarize_benchmark_distribution_compact(benchmark_datasets):
     bench_keys = sorted(benchmark_datasets.keys(), key=lambda x: int(x.split('_')[0]), reverse=True)
@@ -743,6 +747,27 @@ def summarize_benchmark_distribution_compact(benchmark_datasets):
         data.append(row)
 
     compact_df = pd.DataFrame(data)
+
+    return compact_df
+
+
+def export_benchmark_distribution_artifacts(benchmark_datasets, mode_tag: str):
+    os.makedirs("benchmarks", exist_ok=True)
+    compact_df = summarize_benchmark_distribution_compact(benchmark_datasets)
+
+    csv_paths = [
+        "benchmarks/dataset_distribution.csv",
+        f"benchmarks/dataset_distribution_{mode_tag}.csv",
+    ]
+    png_paths = [
+        "benchmarks/dataset_distribution.png",
+        f"benchmarks/dataset_distribution_{mode_tag}.png",
+    ]
+
+    for csv_path in csv_paths:
+        compact_df.to_csv(csv_path, index=False)
+
+    plot_benchmark_distribution_with_duplicates_stacked(benchmark_datasets, output_paths=png_paths)
 
     return compact_df
 
@@ -921,6 +946,7 @@ def run_lazy_training(
 
     benchmark_splits = parse_benchmark_splits(benchmark_value)
     metrics_rows = []
+    benchmark_datasets = {}
 
     for orig_pct, adv_pct in benchmark_splits:
         key = f"{orig_pct}_{adv_pct}"
@@ -929,6 +955,11 @@ def run_lazy_training(
 
         benchmark_train_df = build_lazy_benchmark_split(train_base_df, orig_frac=orig_pct / 100.0, random_state=SEED)
         benchmark_valid_df = build_lazy_benchmark_split(val_base_df, orig_frac=orig_pct / 100.0, random_state=SEED + 101)
+
+        benchmark_datasets[key] = {
+            "train": benchmark_train_df,
+            "valid": benchmark_valid_df,
+        }
 
         if benchmark_train_df.empty or benchmark_valid_df.empty:
             print(
@@ -1068,6 +1099,9 @@ def run_lazy_training(
     metrics_df = pd.DataFrame(metrics_rows)
     metrics_df.to_csv("benchmarks/metrics.csv", index=False)
     print("Saved benchmark metrics to benchmarks/metrics.csv")
+    if benchmark_datasets:
+        export_benchmark_distribution_artifacts(benchmark_datasets, mode_tag=f"{mode}_lazy")
+        print(f"Saved dataset distribution to benchmarks/dataset_distribution_{mode}_lazy.csv/.png")
 
 
 def run_lazy_training_with_split_dirs(
@@ -1423,9 +1457,7 @@ if __name__ == "__main__":
         }
 
     # Benchmark dataset distribution
-    plot_benchmark_distribution_with_duplicates_stacked(benchmark_datasets)
-    benchmark_distribution_df = summarize_benchmark_distribution_compact(benchmark_datasets)
-    benchmark_distribution_df.to_csv("benchmarks/dataset_distribution.csv")
+    export_benchmark_distribution_artifacts(benchmark_datasets, mode_tag="legacy_augmented")
 
     # Lists to store training, validation and test accuracy for plotting
     train_acc_history = {}
