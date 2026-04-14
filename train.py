@@ -141,6 +141,26 @@ def build_devign_model(nodes_dim: int, emb_size: int) -> Devign:
         emb_size=emb_size
     )
 
+
+def parse_benchmark_splits(benchmark_value: str):
+    if benchmark_value is None:
+        return [(100, 0)]
+
+    value = str(benchmark_value).strip().lower()
+    if value in {"all", "full", "auto"}:
+        return [(100 - i, i) for i in range(0, 110, 10)]
+
+    if "_" not in value:
+        raise ValueError("benchmark must be in the form '100_0' or 'all'.")
+
+    left, right = value.split("_", 1)
+    orig_pct = int(left)
+    adv_pct = int(right)
+    if orig_pct + adv_pct != 100:
+        raise ValueError("benchmark percentages must sum to 100.")
+
+    return [(orig_pct, adv_pct)]
+
 class DevignDataset(Dataset):
     def __init__(self, dataset_source, index_file=None, index_df=None, max_load_retries=3):
         self.max_load_retries = max_load_retries
@@ -854,7 +874,12 @@ def build_lazy_benchmark_split(split_df: pd.DataFrame, orig_frac: float, random_
     return result
 
 
-def run_lazy_training(processed_dir: str, index_csv: str, use_sampler_train: bool = True):
+def run_lazy_training(
+    processed_dir: str,
+    index_csv: str,
+    use_sampler_train: bool = True,
+    benchmark_value: str = "all",
+):
     """
     Train Devign directly from split .pt files using lazy loading.
     """
@@ -894,7 +919,7 @@ def run_lazy_training(processed_dir: str, index_csv: str, use_sampler_train: boo
         persistent_workers=True,
     )
 
-    benchmark_splits = [(100 - i, i) for i in range(0, 110, 10)]
+    benchmark_splits = parse_benchmark_splits(benchmark_value)
     metrics_rows = []
 
     for orig_pct, adv_pct in benchmark_splits:
@@ -1050,6 +1075,7 @@ def run_lazy_training_with_split_dirs(
     valid_dir: str,
     test_dir: str,
     use_sampler_train: bool = True,
+    benchmark_value: str = "all",
 ):
     """
     Train Devign from pre-split lazy directories (train/valid/test),
@@ -1092,7 +1118,7 @@ def run_lazy_training_with_split_dirs(
         persistent_workers=True,
     )
 
-    benchmark_splits = [(100 - i, i) for i in range(0, 110, 10)]
+    benchmark_splits = parse_benchmark_splits(benchmark_value)
     metrics_rows = []
 
     for orig_pct, adv_pct in benchmark_splits:
@@ -1282,6 +1308,11 @@ def parse_args():
         dest="use_sampler_train",
         help="Disable WeightedRandomSampler on training loader.",
     )
+    parser.add_argument(
+        "--benchmark",
+        default="all",
+        help="Benchmark to run: 'all' or a single split like '100_0'. Default: all.",
+    )
 
     # Backward-compatible UX for users who type `python train.py -original`.
     parser.add_argument("-original", "--original", action="store_true", help="Shortcut to set --mode original.")
@@ -1312,6 +1343,7 @@ if __name__ == "__main__":
     print(f"  mode: {mode}")
     print(f"  index_csv: {index_csv}")
     print(f"  use_sampler_train: {cli_args.use_sampler_train}")
+    print(f"  benchmark: {cli_args.benchmark}")
 
     split_train_dir = os.path.join(processed_dir, f"{mode}_train")
     split_valid_dir = os.path.join(processed_dir, f"{mode}_valid")
@@ -1332,6 +1364,7 @@ if __name__ == "__main__":
             split_valid_dir,
             split_test_dir,
             use_sampler_train=cli_args.use_sampler_train,
+            benchmark_value=cli_args.benchmark,
         )
         sys.exit(0)
 
@@ -1341,6 +1374,7 @@ if __name__ == "__main__":
             processed_dir,
             index_csv,
             use_sampler_train=cli_args.use_sampler_train,
+            benchmark_value=cli_args.benchmark,
         )
         sys.exit(0)
 
@@ -1363,7 +1397,7 @@ if __name__ == "__main__":
 
     # Define benchmark splits: (orig, adv)
     benchmark_datasets = {}
-    benchmark_splits = [(100-i, i) for i in range(0, 110, 10)]
+    benchmark_splits = parse_benchmark_splits(cli_args.benchmark)
 
     for orig_pct, adv_pct in benchmark_splits:
         key = f'{orig_pct}_{adv_pct}'
