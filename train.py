@@ -300,12 +300,28 @@ class DevignDataset(Dataset):
 
         self.sampler = sampler
 
-    def get_loader(self, batch_size, shuffle=True, use_sampler=True):
+    def get_loader(
+        self,
+        batch_size,
+        shuffle=True,
+        use_sampler=True,
+        num_workers=0,
+        pin_memory=False,
+        persistent_workers=False,
+    ):
+        loader_kwargs = {
+            "dataset": self,
+            "batch_size": batch_size,
+            "num_workers": num_workers,
+            "pin_memory": pin_memory,
+            "persistent_workers": bool(num_workers > 0 and persistent_workers),
+        }
+
         if use_sampler and self.sampler is not None:
-            return DataLoader(dataset=self, batch_size=batch_size, shuffle=False, sampler=self.sampler)
-        else:
-            # When not using the sampler, use normal shuffling.
-            return DataLoader(dataset=self, batch_size=batch_size, shuffle=shuffle)
+            return DataLoader(**loader_kwargs, shuffle=False, sampler=self.sampler)
+
+        # When not using the sampler, use normal shuffling.
+        return DataLoader(**loader_kwargs, shuffle=shuffle)
 
 def group_train_val_test_split(df: pd.DataFrame, test_size=0.1, val_size=0.1, random_state=SEED):
     # Get unique ids (each id groups together an original and its adversarial counterpart)
@@ -838,7 +854,7 @@ def build_lazy_benchmark_split(split_df: pd.DataFrame, orig_frac: float, random_
     return result
 
 
-def run_lazy_training(processed_dir: str, index_csv: str):
+def run_lazy_training(processed_dir: str, index_csv: str, use_sampler_train: bool = True):
     """
     Train Devign directly from split .pt files using lazy loading.
     """
@@ -899,10 +915,10 @@ def run_lazy_training(processed_dir: str, index_csv: str):
         train_dataset = DevignDataset(processed_dir, index_df=benchmark_train_df)
         val_dataset = DevignDataset(processed_dir, index_df=benchmark_valid_df)
 
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=PROCESS["batch_size"],
+        train_loader = train_dataset.get_loader(
+            PROCESS["batch_size"],
             shuffle=True,
+            use_sampler=use_sampler_train,
             num_workers=4,
             pin_memory=torch.cuda.is_available(),
             persistent_workers=True,
@@ -1029,7 +1045,12 @@ def run_lazy_training(processed_dir: str, index_csv: str):
     print("Saved benchmark metrics to benchmarks/metrics.csv")
 
 
-def run_lazy_training_with_split_dirs(train_dir: str, valid_dir: str, test_dir: str):
+def run_lazy_training_with_split_dirs(
+    train_dir: str,
+    valid_dir: str,
+    test_dir: str,
+    use_sampler_train: bool = True,
+):
     """
     Train Devign from pre-split lazy directories (train/valid/test),
     each containing sample_*.pt and index.csv.
@@ -1092,10 +1113,10 @@ def run_lazy_training_with_split_dirs(train_dir: str, valid_dir: str, test_dir: 
         train_dataset = DevignDataset(train_dir, index_df=benchmark_train_df)
         val_dataset = DevignDataset(valid_dir, index_df=benchmark_valid_df)
 
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=PROCESS["batch_size"],
+        train_loader = train_dataset.get_loader(
+            PROCESS["batch_size"],
             shuffle=True,
+            use_sampler=use_sampler_train,
             num_workers=4,
             pin_memory=torch.cuda.is_available(),
             persistent_workers=True,
@@ -1249,6 +1270,18 @@ def parse_args():
         action="store_true",
         help="Force using flat lazy-loading mode with processed_data/index.csv.",
     )
+    parser.add_argument(
+        "--use-sampler-train",
+        action="store_true",
+        default=True,
+        help="Use WeightedRandomSampler on training loader to balance classes (default: enabled).",
+    )
+    parser.add_argument(
+        "--no-sampler-train",
+        action="store_false",
+        dest="use_sampler_train",
+        help="Disable WeightedRandomSampler on training loader.",
+    )
 
     # Backward-compatible UX for users who type `python train.py -original`.
     parser.add_argument("-original", "--original", action="store_true", help="Shortcut to set --mode original.")
@@ -1278,6 +1311,7 @@ if __name__ == "__main__":
     print(f"  processed_data_dir: {processed_dir}")
     print(f"  mode: {mode}")
     print(f"  index_csv: {index_csv}")
+    print(f"  use_sampler_train: {cli_args.use_sampler_train}")
 
     split_train_dir = os.path.join(processed_dir, f"{mode}_train")
     split_valid_dir = os.path.join(processed_dir, f"{mode}_valid")
@@ -1293,12 +1327,21 @@ if __name__ == "__main__":
         print(f"  Train dir: {split_train_dir}")
         print(f"  Valid dir: {split_valid_dir}")
         print(f"  Test  dir: {split_test_dir}")
-        run_lazy_training_with_split_dirs(split_train_dir, split_valid_dir, split_test_dir)
+        run_lazy_training_with_split_dirs(
+            split_train_dir,
+            split_valid_dir,
+            split_test_dir,
+            use_sampler_train=cli_args.use_sampler_train,
+        )
         sys.exit(0)
 
     if os.path.exists(index_csv):
         print("Lazy-loading mode enabled (using processed_data/*.pt)")
-        run_lazy_training(processed_dir, index_csv)
+        run_lazy_training(
+            processed_dir,
+            index_csv,
+            use_sampler_train=cli_args.use_sampler_train,
+        )
         sys.exit(0)
 
     # Load processed datasets
