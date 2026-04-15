@@ -904,6 +904,7 @@ def run_lazy_training(
     index_csv: str,
     use_sampler_train: bool = True,
     benchmark_value: str = "all",
+    mode_tag: str = "lazy",
 ):
     """
     Train Devign directly from split .pt files using lazy loading.
@@ -1100,8 +1101,8 @@ def run_lazy_training(
     metrics_df.to_csv("benchmarks/metrics.csv", index=False)
     print("Saved benchmark metrics to benchmarks/metrics.csv")
     if benchmark_datasets:
-        export_benchmark_distribution_artifacts(benchmark_datasets, mode_tag=f"{mode}_lazy")
-        print(f"Saved dataset distribution to benchmarks/dataset_distribution_{mode}_lazy.csv/.png")
+        export_benchmark_distribution_artifacts(benchmark_datasets, mode_tag=mode_tag)
+        print(f"Saved dataset distribution to benchmarks/dataset_distribution_{mode_tag}.csv/.png")
 
 
 def run_lazy_training_with_split_dirs(
@@ -1110,6 +1111,7 @@ def run_lazy_training_with_split_dirs(
     test_dir: str,
     use_sampler_train: bool = True,
     benchmark_value: str = "all",
+    mode_tag: str = "lazy",
 ):
     """
     Train Devign from pre-split lazy directories (train/valid/test),
@@ -1154,6 +1156,7 @@ def run_lazy_training_with_split_dirs(
 
     benchmark_splits = parse_benchmark_splits(benchmark_value)
     metrics_rows = []
+    benchmark_datasets = {}
 
     for orig_pct, adv_pct in benchmark_splits:
         key = f"{orig_pct}_{adv_pct}"
@@ -1162,6 +1165,11 @@ def run_lazy_training_with_split_dirs(
 
         benchmark_train_df = build_lazy_benchmark_split(train_base_df, orig_frac=orig_pct / 100.0, random_state=SEED)
         benchmark_valid_df = build_lazy_benchmark_split(val_base_df, orig_frac=orig_pct / 100.0, random_state=SEED + 101)
+
+        benchmark_datasets[key] = {
+            "train": benchmark_train_df,
+            "valid": benchmark_valid_df,
+        }
 
         if benchmark_train_df.empty or benchmark_valid_df.empty:
             print(
@@ -1301,6 +1309,9 @@ def run_lazy_training_with_split_dirs(
     metrics_df = pd.DataFrame(metrics_rows)
     metrics_df.to_csv("benchmarks/metrics.csv", index=False)
     print("Saved benchmark metrics to benchmarks/metrics.csv")
+    if benchmark_datasets:
+        export_benchmark_distribution_artifacts(benchmark_datasets, mode_tag=mode_tag)
+        print(f"Saved dataset distribution to benchmarks/dataset_distribution_{mode_tag}.csv/.png")
 
 def parse_args():
     env_processed_dir = os.getenv("PROCESSED_DATA_DIR", "processed_data")
@@ -1399,6 +1410,7 @@ if __name__ == "__main__":
             split_test_dir,
             use_sampler_train=cli_args.use_sampler_train,
             benchmark_value=cli_args.benchmark,
+            mode_tag=f"{mode}_lazy",
         )
         sys.exit(0)
 
@@ -1409,6 +1421,7 @@ if __name__ == "__main__":
             index_csv,
             use_sampler_train=cli_args.use_sampler_train,
             benchmark_value=cli_args.benchmark,
+            mode_tag=f"{mode}_lazy",
         )
         sys.exit(0)
 
