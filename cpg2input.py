@@ -431,55 +431,68 @@ def prepare_original_dataset(df):
     return prepared_df
 
 
-class TokenCorpus:
-    def __init__(self, functions, sample_timeout: int, stage: str):
-        self.functions = functions
-        self.sample_timeout = sample_timeout
-        self.stage = stage
-        self.total = 0
-        self.used = 0
-        self.skipped = 0
-
-    def __iter__(self):
-        for idx, func in enumerate(self.functions):
-            self.total += 1
-            try:
-                tokens = run_with_timeout(
-                    self.sample_timeout,
-                    f"{self.stage} tokenization for sample {idx}",
-                    tokenize_code,
-                    func,
-                )
-            except TimeoutError as exc:
-                self.skipped += 1
-                print(f"[WARN] Skipping sample {idx} during {self.stage}: {exc}")
-                continue
-
-            if tokens:
-                self.used += 1
-                yield tokens
-
-
 def train_word2vec_once(functions, sample_timeout: int) -> Word2Vec:
-    print("\n[WORD2VEC] Training once on full corpus (streaming tokenizer)...")
-    w2vmodel = Word2Vec(**WORD2VEC_ARGS)
+    print("\n[WORD2VEC] Pre-tokenizing full corpus once into memory...", flush=True)
 
-    vocab_corpus = TokenCorpus(functions, sample_timeout, stage="build_vocab")
-    w2vmodel.build_vocab(corpus_iterable=vocab_corpus)
+    tokenized_corpus: List[List[str]] = []
+    total = 0
+    skipped = 0
+    empty = 0
+    start_time = time.monotonic()
 
-    if w2vmodel.corpus_count == 0:
+    for idx, func in enumerate(functions):
+        total += 1
+        try:
+            tokens = run_with_timeout(
+                sample_timeout,
+                f"word2vec tokenization for sample {idx}",
+                tokenize_code,
+                func,
+            )
+        except TimeoutError as exc:
+            skipped += 1
+            print(f"[WARN] Skipping sample {idx} during Word2Vec tokenization: {exc}", flush=True)
+            continue
+
+        if tokens:
+            tokenized_corpus.append(tokens)
+        else:
+            empty += 1
+
+        if total % 1000 == 0:
+            elapsed_minutes = (time.monotonic() - start_time) / 60
+            print(
+                f"  [WORD2VEC] Tokenized {total} samples "
+                f"(used={len(tokenized_corpus)}, empty={empty}, skipped={skipped}, "
+                f"elapsed={elapsed_minutes:.1f} min)",
+                flush=True,
+            )
+
+    if not tokenized_corpus:
         raise ValueError("Token corpus is empty. Cannot train Word2Vec.")
 
-    train_corpus = TokenCorpus(functions, sample_timeout, stage="train")
-    w2vmodel.train(train_corpus, total_examples=w2vmodel.corpus_count, epochs=5)
+    print(
+        f"  Tokenized samples used: {len(tokenized_corpus)}/{total} "
+        f"(empty={empty}, skipped={skipped})",
+        flush=True,
+    )
+    print("\n[WORD2VEC] Training once on pre-tokenized corpus...", flush=True)
 
-    print(f"  ✓ Build vocab samples used: {vocab_corpus.used}/{vocab_corpus.total}")
-    if vocab_corpus.skipped:
-        print(f"  ✓ Build vocab skipped slow samples: {vocab_corpus.skipped}")
-    print(f"  ✓ Train samples used: {train_corpus.used}/{train_corpus.total}")
-    if train_corpus.skipped:
-        print(f"  ✓ Train skipped slow samples: {train_corpus.skipped}")
-    print("  ✓ Word2Vec training completed.")
+    w2vmodel = Word2Vec(**WORD2VEC_ARGS)
+
+    w2vmodel.build_vocab(corpus_iterable=tokenized_corpus)
+
+    if w2vmodel.corpus_count == 0:
+        raise ValueError("Word2Vec vocabulary is empty. Cannot train Word2Vec.")
+
+    w2vmodel.train(
+        tokenized_corpus,
+        total_examples=w2vmodel.corpus_count,
+        epochs=5,
+    )
+
+    print(f"  Word2Vec vocabulary samples: {w2vmodel.corpus_count}", flush=True)
+    print("  ✓ Word2Vec training completed.", flush=True)
     return w2vmodel
 
 
@@ -802,6 +815,11 @@ def enforce_original_sanity(df: pd.DataFrame) -> pd.DataFrame:
 
 
 if __name__ == "__main__":
+    import logging
+
+    logging.getLogger().setLevel(logging.ERROR)
+    logging.disable(logging.WARNING)
+
     for dataset in args.dataset:
         mode = args.mode
         print(f"\nGenerating INPUT for {dataset.upper()} dataset ({mode.upper()} mode)")
