@@ -4,6 +4,9 @@ import sys
 
 import pandas as pd
 import torch
+import torch.nn.functional as F
+from sklearn import metrics
+from sklearn.metrics import confusion_matrix
 from torch_geometric.loader import DataLoader
 
 if os.getcwd() not in sys.path:
@@ -14,7 +17,6 @@ from train import (  # noqa: E402
     PROCESS,
     DevignDataset,
     build_devign_model,
-    eval_model,
     infer_graph_dims_from_index_and_dir,
 )
 
@@ -118,6 +120,104 @@ def load_checkpoint(model, state_dict):
     return model
 
 
+def flatten_batches(values):
+    flattened = []
+    for value in values:
+        flattened.extend(value.reshape(-1).tolist())
+    return flattened
+
+
+def evaluate_logits_model(model, dataloader, threshold: float, pairwise: bool):
+    loss_list = []
+    labels = []
+    predicts = []
+    probabilities = []
+    logits = []
+    pair_groups = {}
+    loss_lambda = 1e-6
+
+    model.eval()
+    with torch.no_grad():
+        for batch in dataloader:
+            graph = batch["input"].to(DEVICE)
+            target = graph.y
+            logit = model(graph)
+            prob = torch.sigmoid(logit)
+            pred = (prob >= threshold).float()
+            loss = F.binary_cross_entropy_with_logits(logit, target) + F.l1_loss(logit, target) * loss_lambda
+
+            loss_list.append(float(loss.item()))
+            labels.append(target.detach().cpu())
+            predicts.append(pred.detach().cpu())
+            probabilities.append(prob.detach().cpu())
+            logits.append(logit.detach().cpu())
+
+            if pairwise:
+                for sample_id, pred_value, true_value in zip(
+                    batch["id"],
+                    pred.detach().cpu().view(-1).long().tolist(),
+                    target.detach().cpu().view(-1).long().tolist(),
+                ):
+                    pair_groups.setdefault(str(sample_id), []).append((pred_value, true_value))
+
+    y_true = flatten_batches(labels)
+    y_pred = flatten_batches(predicts)
+    y_prob = flatten_batches(probabilities)
+    y_logit = flatten_batches(logits)
+
+    confusion = confusion_matrix(y_true=y_true, y_pred=y_pred, labels=[0.0, 1.0])
+    tn, fp, fn, tp = confusion.ravel()
+
+    print(f"\nConfusion matrix:\n{confusion}")
+    print(f"TP: {tp}, FP: {fp}, TN: {tn}, FN: {fn}\n")
+    print(
+        "Probability summary: "
+        f"min={min(y_prob):.6f}, mean={sum(y_prob) / len(y_prob):.6f}, max={max(y_prob):.6f}"
+    )
+    print(
+        "Logit summary: "
+        f"min={min(y_logit):.6f}, mean={sum(y_logit) / len(y_logit):.6f}, max={max(y_logit):.6f}"
+    )
+
+    metrics_out = {
+        "Accuracy": metrics.accuracy_score(y_true=y_true, y_pred=y_pred),
+        "Loss": sum(loss_list) / len(loss_list),
+        "Precision": metrics.precision_score(y_true=y_true, y_pred=y_pred, zero_division=0),
+        "Recall": metrics.recall_score(y_true=y_true, y_pred=y_pred, zero_division=0),
+        "F-measure": metrics.f1_score(y_true=y_true, y_pred=y_pred, zero_division=0),
+        "Precision-Recall AUC": metrics.average_precision_score(y_true=y_true, y_score=y_prob),
+        "AUC": metrics.roc_auc_score(y_true=y_true, y_score=y_prob),
+        "MCC": metrics.matthews_corrcoef(y_true=y_true, y_pred=y_pred),
+        "Avg. Error (%)": sum(abs(prob - label) * 100 for prob, label in zip(y_prob, y_true)) / len(y_true),
+    }
+
+    if pairwise:
+        stats = {"P-C": 0, "P-V": 0, "P-B": 0, "P-R": 0}
+        total = 0
+        for group in pair_groups.values():
+            if len(group) != 2:
+                continue
+            sorted_group = sorted(group, key=lambda item: item[1], reverse=True)
+            (p1, y1), (p2, y2) = sorted_group
+            if y1 != 1 or y2 != 0:
+                continue
+            total += 1
+            if p1 == 1 and p2 == 0:
+                stats["P-C"] += 1
+            elif p1 == 1 and p2 == 1:
+                stats["P-V"] += 1
+            elif p1 == 0 and p2 == 0:
+                stats["P-B"] += 1
+            elif p1 == 0 and p2 == 1:
+                stats["P-R"] += 1
+
+        for key in stats:
+            stats[key] = stats[key] / total if total > 0 else 0.0
+        metrics_out.update(stats)
+
+    return metrics_out
+
+
 def main():
     args = parse_args()
     index_csv = args.index_csv or os.path.join(args.processed_data_dir, "index.csv")
@@ -164,7 +264,7 @@ def main():
     print(f"  emb_size: {emb_size}")
     print(f"  device: {DEVICE}")
 
-    metrics = eval_model(model, loader, threshold=args.threshold, test=args.pairwise)
+    metrics = evaluate_logits_model(model, loader, threshold=args.threshold, pairwise=args.pairwise)
 
     print("\nEvaluation metrics:")
     for key, value in metrics.items():
