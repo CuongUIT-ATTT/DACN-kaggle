@@ -19,6 +19,38 @@ from train import (  # noqa: E402
 )
 
 
+class FixedNodeDimDataset:
+    def __init__(self, dataset, nodes_dim: int):
+        self.dataset = dataset
+        self.nodes_dim = nodes_dim
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        sample = self.dataset[index]
+        graph = sample["input"]
+
+        current_nodes = int(graph.x.shape[0])
+        if current_nodes > self.nodes_dim:
+            graph.x = graph.x[: self.nodes_dim, :]
+            if graph.edge_index is not None and graph.edge_index.numel() > 0:
+                keep_edges = (graph.edge_index[0] < self.nodes_dim) & (graph.edge_index[1] < self.nodes_dim)
+                graph.edge_index = graph.edge_index[:, keep_edges]
+        elif current_nodes < self.nodes_dim:
+            pad_rows = self.nodes_dim - current_nodes
+            padding = torch.zeros(
+                pad_rows,
+                graph.x.shape[1],
+                dtype=graph.x.dtype,
+                device=graph.x.device,
+            )
+            graph.x = torch.cat([graph.x, padding], dim=0)
+
+        sample["input"] = graph
+        return sample
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Evaluate a trained Devign checkpoint on a processed .pt dataset."
@@ -63,9 +95,25 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_checkpoint(model, model_path: str):
+def load_state_dict(model_path: str):
     checkpoint = torch.load(model_path, map_location=DEVICE)
-    state_dict = checkpoint.get("state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+    return checkpoint.get("state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+
+
+def strip_module_prefix(state_dict):
+    if not any(key.startswith("module.") for key in state_dict):
+        return state_dict
+    return {key.removeprefix("module."): value for key, value in state_dict.items()}
+
+
+def infer_checkpoint_nodes_dim(state_dict):
+    for key, tensor in state_dict.items():
+        if key.endswith("conv1d_1.weight") and hasattr(tensor, "shape") and len(tensor.shape) >= 2:
+            return int(tensor.shape[1])
+    return None
+
+
+def load_checkpoint(model, state_dict):
     model.load_state_dict(state_dict)
     return model
 
@@ -84,13 +132,20 @@ def main():
     if not required_cols.issubset(index_df.columns):
         raise ValueError(f"{index_csv} missing required columns: {required_cols}")
 
-    nodes_dim, emb_size = infer_graph_dims_from_index_and_dir(index_df, args.processed_data_dir)
+    data_nodes_dim, emb_size = infer_graph_dims_from_index_and_dir(index_df, args.processed_data_dir)
+    state_dict = strip_module_prefix(load_state_dict(args.model_path))
+    checkpoint_nodes_dim = infer_checkpoint_nodes_dim(state_dict)
+    nodes_dim = checkpoint_nodes_dim or data_nodes_dim
+
     model = build_devign_model(nodes_dim, emb_size)
-    model = load_checkpoint(model, args.model_path)
+    model = load_checkpoint(model, state_dict)
     model.to(DEVICE)
     model.eval()
 
-    dataset = DevignDataset(args.processed_data_dir, index_df=index_df)
+    dataset = FixedNodeDimDataset(
+        DevignDataset(args.processed_data_dir, index_df=index_df),
+        nodes_dim=nodes_dim,
+    )
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -104,7 +159,8 @@ def main():
     print(f"  index_csv: {index_csv}")
     print(f"  model_path: {args.model_path}")
     print(f"  samples: {len(index_df)}")
-    print(f"  nodes_dim: {nodes_dim}")
+    print(f"  data_nodes_dim: {data_nodes_dim}")
+    print(f"  model_nodes_dim: {nodes_dim}")
     print(f"  emb_size: {emb_size}")
     print(f"  device: {DEVICE}")
 
